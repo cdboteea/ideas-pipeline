@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.matias.ideas-gmail-tostage</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/mmirvois/clawd/venv/bin/python</string>
+        <string>/Users/mmirvois/projects/ideas-pipeline/scripts/poll_gmail_tostage.py</string>
+        <string>--max-messages</string>
+        <string>25</string>
+    </array>
+
+    <!-- Poll Gmail 'ToStage' label → Obsidian Inbox.
+         Runs 09:00, 13:00, 17:00 every day (3× daily, light touch). -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>17</integer><key>Minute</key><integer>0</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mmirvois/clawd/logs/ideas-gmail-tostage.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/mmirvois/clawd/logs/ideas-gmail-tostage.err</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
