@@ -89,12 +89,15 @@ def _mk_gmail_message(msg_id, subject, sender, body_text, date="Wed, 23 Apr 2026
 def isolated_vault(tmp_path, monkeypatch):
     """Point the ideas package at a fresh ObsidianVault under tmp_path."""
     vault = tmp_path / "ObsidianVault"
+    import ideas.storage as storage
     monkeypatch.setattr("ideas.config.VAULT", vault)
     monkeypatch.setattr("ideas.config.INBOX", vault / "Inbox")
     monkeypatch.setattr("ideas.config.IDEAS", vault / "Ideas")
     monkeypatch.setattr("ideas.config.ARCHIVE", vault / "Archive")
     monkeypatch.setattr("ideas.config.META", vault / "_meta")
-    import ideas.storage as storage  # noqa: F401 — force import
+    monkeypatch.setattr(storage, "INBOX", vault / "Inbox")
+    monkeypatch.setattr(storage, "IDEAS", vault / "Ideas")
+    monkeypatch.setattr(storage, "ARCHIVE", vault / "Archive")
     from ideas.config import ensure_dirs
     ensure_dirs()
     yield vault

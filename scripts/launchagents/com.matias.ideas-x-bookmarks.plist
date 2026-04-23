@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.matias.ideas-x-bookmarks</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/mmirvois/clawd/venv/bin/python</string>
+        <string>/Users/mmirvois/projects/ideas-pipeline/scripts/poll_x_bookmarks.py</string>
+        <string>--count</string>
+        <string>30</string>
+    </array>
+
+    <!-- Poll X bookmarks → Obsidian Inbox. Once daily 09:30 local.
+         Light touch — Matias expects bookmarks to be durable on X, the
+         local state file dedupes us. --unbookmark is OFF by default. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>9</integer>
+        <key>Minute</key><integer>30</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mmirvois/clawd/logs/ideas-x-bookmarks.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/mmirvois/clawd/logs/ideas-x-bookmarks.err</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
