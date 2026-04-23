@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.matias.ideas-telegram-queue</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/mmirvois/clawd/venv/bin/python</string>
+        <string>/Users/mmirvois/projects/ideas-pipeline/scripts/poll_telegram_queue.py</string>
+    </array>
+
+    <!-- Drain Telegram message queue → Obsidian Inbox.
+         Queue at ~/clawd/data/telegram-queue.jsonl; any source (OpenClaw
+         plugin, webhook) can append. Runs every 15 min during 08:00-22:00. -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mmirvois/clawd/logs/ideas-telegram-queue.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/mmirvois/clawd/logs/ideas-telegram-queue.err</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

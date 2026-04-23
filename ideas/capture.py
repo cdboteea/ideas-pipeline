@@ -96,6 +96,47 @@ def stage_research_output(
     return str(path)
 
 
+def stage_telegram(
+    text: str,
+    *,
+    sender: str,
+    chat_id: Optional[int | str] = None,
+    received_at: Optional[str] = None,
+    message_id: Optional[str] = None,
+    session_ref: Optional[str] = None,
+) -> str:
+    """Stage a Telegram message → Obsidian Inbox.
+
+    Called by the queue poller (scripts/poll_telegram_queue.py) on every
+    entry in ~/clawd/data/telegram-queue.jsonl. The queue design avoids
+    conflicting with OpenClaw's own `getUpdates` polling: any source
+    (OpenClaw plugin, webhook, future receiver) can append JSONL lines.
+    """
+    title_hint = text.strip()[:80] or f"Telegram from {sender}"
+    extras = [f"From: {sender}"]
+    if chat_id is not None:
+        extras.append(f"Chat: {chat_id}")
+    if received_at:
+        extras.append(f"Received: {received_at}")
+    if message_id:
+        extras.append(f"Telegram-ID: {message_id}")
+    header = "\n".join(extras)
+    full_body = f"{header}\n\n{text}"
+
+    source_url = f"telegram://{chat_id}/{message_id}" if (chat_id and message_id) else None
+    item = InboxItem.make(
+        title_hint=title_hint,
+        source_type="telegram",
+        raw_content=full_body,
+        source_url=source_url,
+        source_author=sender,
+        captured_by="telegram-queue-poller",
+        session_ref=session_ref,
+    )
+    path = write_inbox(item)
+    return str(path)
+
+
 def stage_email(
     subject: str,
     sender: str,
