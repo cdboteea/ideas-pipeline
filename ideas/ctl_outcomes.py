@@ -46,7 +46,21 @@ def _strip_dollar(ticker: str | None) -> str | None:
 
 
 def _is_futures_ticker(ticker: str | None) -> bool:
-    """Crude futures detector. firstrate has equities/ETFs only."""
+    """Returns True for futures contract codes (`$SB_F`, `$ZS_F`, `$ES_F`).
+
+    DECISION 2026-05-06 — futures MTM is PERMANENTLY skipped, not a TODO.
+    Evaluated UW (`mcp__unusual-whales__get_futures_indices`) and rejected:
+      - keyed by descriptive name ("US Sugar #11"), not contract code → needs
+        fragile manual mapping
+      - snapshot-only, no historical bars → can't walk MFE/MAE
+      - no contract-month resolution → can't reconcile to the trader's post
+
+    Lifecycle tracking on the posts themselves (entry → adds → trim → explicit
+    close, with extracted Risk levels + targets + horizon as structured text)
+    is enough for the user's actual goal — timely awareness of what was
+    posted. Numeric MTM was nice-to-have, not required. See
+    `~/clawd/research/workflows/ctl-pipeline-v2-2026-05-06.md` §Source coverage.
+    """
     if not ticker:
         return False
     return ticker.upper().endswith("_F")

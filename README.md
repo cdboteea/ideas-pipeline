@@ -108,8 +108,8 @@ Outcome enrichment splices two sources, mirroring the strategy-engine convention
 
 Coverage by ticker shape:
 - **Equities & ETFs** (`$AMD`, `$SPY`, `$XLK`, `$NVDA`, …) — fully covered (firstrate historical + EODHD recent + EODHD live).
-- **Futures** (`$SB_F`, `$ZS_F`, `$ES_F`, …) — skipped. Neither source is set up for them. Threads still track post lifecycle and explicit-close events; no MTM numerics. **UW** could be evaluated as a futures source later.
-- **Crypto** — not auto-detected today; would need a `.CC` suffix or routing through `hyperliquid.duckdb`.
+- **Futures** (`$SB_F`, `$ZS_F`, `$ES_F`, …) — **MTM permanently skipped**. UW has futures snapshots but keyed by descriptive name not contract code, snapshot-only with no historical bars, and no contract-month resolution — not a fit. Threads still track post lifecycle + explicit closes; the structured idea text (Risk levels, targets, horizon) is enough for timely notification, which is what we actually wanted.
+- **Crypto** — not auto-detected today; deferred (would need `.CC` suffix or routing through `hyperliquid.duckdb`).
 
 #### Alerts (spec'd, log-channel-only today)
 
