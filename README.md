@@ -101,7 +101,15 @@ Each post asks the LLM for `thread_intent`: `"new" | "update" | "close" | "unsur
 
 #### Coverage notes
 
-Outcome enrichment uses `~/clawd/data/firstrate.duckdb` (daily resolution, monthly-refreshed → ~5 weeks behind today). Equities/ETFs are fully covered; futures (`$SB_F`, `$ZS_F`, `$ES_F`, etc.) are skipped — threads still track post lifecycle, just no MTM. Live-data splice via EODHD is a future enhancement.
+Outcome enrichment splices two sources, mirroring the strategy-engine convention:
+
+- **`firstrate.duckdb`** — historical daily bars, monthly-refreshed (this is by design — it's the historical reference, not a live feed). Covers the back portion of any thread's history.
+- **EODHD** — live quotes + recent EOD bars for any equity ticker. Fills in the front portion of a thread's history beyond firstrate's ceiling, plus the live `last_mark_price` snapshot. Reads its API key from macOS keychain (`eodhd-api-key`).
+
+Coverage by ticker shape:
+- **Equities & ETFs** (`$AMD`, `$SPY`, `$XLK`, `$NVDA`, …) — fully covered (firstrate historical + EODHD recent + EODHD live).
+- **Futures** (`$SB_F`, `$ZS_F`, `$ES_F`, …) — skipped. Neither source is set up for them. Threads still track post lifecycle and explicit-close events; no MTM numerics. **UW** could be evaluated as a futures source later.
+- **Crypto** — not auto-detected today; would need a `.CC` suffix or routing through `hyperliquid.duckdb`.
 
 #### Alerts (spec'd, log-channel-only today)
 

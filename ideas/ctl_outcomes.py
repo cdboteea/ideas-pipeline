@@ -1,23 +1,23 @@
 """CTL outcome enrichment — task #123 v2.
 
-Walks every open|partial trade thread, fetches price history from
-~/clawd/data/firstrate.duckdb between `opened_at` and now, computes
-MFE / MAE / current_pnl, and auto-closes threads when the price hits
-the extracted stop or target.
+Walks every open|partial trade thread, splices price history from two
+sources (matching the strategy-engine convention), computes MFE / MAE /
+current_pnl, and auto-closes threads when the price hits the extracted
+stop or target.
 
-Coverage:
-  - Equities & ETFs (e.g. $AMD, $SPY, $XLK) — full coverage from firstrate
-  - Futures (e.g. $SB_F, $ZS_F, $ES_F) — NOT covered; entry_price_actual
-    stays NULL. Document as a v2 limitation; futures threads still get
-    last_update_at + state tracking, just no MTM numerics.
-  - Crypto — would need a different source (hyperliquid.duckdb); not
-    implemented in v2.
-
-Recent-data gap:
-  firstrate is monthly-refreshed and runs ~5 weeks behind today. For
-  trades opened in that window, last_mark_price is the most recent
-  available daily close. If/when we wire EODHD intraday splice (per
-  citrini-pipeline's pattern), drop it here too.
+Data sources:
+  - **firstrate.duckdb** — historical bars (monthly refresh; the right
+    source for the MFE/MAE walk over the BACK part of a thread's
+    history, which is what it's designed for).
+  - **EODHD** — live equity quotes + recent EOD bars for any ticker the
+    keychain has access to. Used to fill in the FRONT (recent) part
+    of a thread's history that firstrate hasn't ingested yet, plus the
+    `last_mark_price` snapshot.
+  - Futures ($SB_F, $ZS_F, $ES_F) — neither source carries them at the
+    level we need. Threads still get post-lifecycle tracking; no MTM
+    numerics. Skip futures cleanly.
+  - Crypto — would need hyperliquid.duckdb / EODHD `.CC` suffix; not
+    auto-detected in v2.
 
 CLI: scripts/enrich_ctl_outcomes.py
 """
@@ -31,6 +31,7 @@ import duckdb
 
 from . import ctl_extractor as ctl
 from . import ctl_threads
+from . import eodhd_prices
 
 
 FIRSTRATE_DB = Path.home() / "clawd" / "data" / "firstrate.duckdb"
@@ -52,34 +53,114 @@ def _is_futures_ticker(ticker: str | None) -> bool:
 
 
 def fetch_bars(symbol: str, *, start: datetime, end: datetime,
-                con=None) -> list[dict]:
+                con=None,
+                splice_eodhd: bool = True,
+                eodhd_session=None) -> list[dict]:
     """Fetch daily bars for `symbol` between `start` and `end` (inclusive).
 
-    Returns [{datetime, open, high, low, close}, …] in chronological order.
-    Empty list on no data.
+    Splices two sources, in this order:
+      1. **firstrate.duckdb** — covers the historical span. Returns rows up
+         to firstrate's ceiling (~3-5 weeks behind today, by design).
+      2. **EODHD** EOD endpoint — fills in any rows AFTER the firstrate
+         ceiling, up to `end`. Skipped when `splice_eodhd=False` (test
+         isolation) or when no EODHD key is configured.
+
+    Returns [{datetime, open, high, low, close}, …] chronologically.
+    Empty list on no data anywhere.
     """
+    bars: list[dict] = []
     own_con = con is None
+    fr_ceiling = None
+
     if own_con:
-        if not FIRSTRATE_DB.exists():
-            return []
-        con = duckdb.connect(str(FIRSTRATE_DB), read_only=True)
+        if FIRSTRATE_DB.exists():
+            con = duckdb.connect(str(FIRSTRATE_DB), read_only=True)
+        else:
+            con = None
     try:
-        rows = con.execute("""
-            SELECT datetime, open, high, low, close
-            FROM ohlcv
-            WHERE symbol = ?
-              AND timeframe = 'day'
-              AND datetime BETWEEN ? AND ?
-            ORDER BY datetime
-        """, [symbol, start, end]).fetchall()
-        return [
-            {"datetime": r[0], "open": r[1], "high": r[2],
-             "low": r[3], "close": r[4]}
-            for r in rows
-        ]
+        if con is not None:
+            rows = con.execute("""
+                SELECT datetime, open, high, low, close
+                FROM ohlcv
+                WHERE symbol = ?
+                  AND timeframe = 'day'
+                  AND datetime BETWEEN ? AND ?
+                ORDER BY datetime
+            """, [symbol, start, end]).fetchall()
+            bars = [
+                {"datetime": r[0], "open": r[1], "high": r[2],
+                 "low": r[3], "close": r[4], "source": "firstrate"}
+                for r in rows
+            ]
+            if bars:
+                fr_ceiling = bars[-1]["datetime"]
     finally:
-        if own_con:
+        if own_con and con is not None:
             con.close()
+
+    if not splice_eodhd:
+        return bars
+
+    # Splice EODHD for any window beyond firstrate's coverage. We pull
+    # from (firstrate-last-bar + 1 day) through `end`. If firstrate had
+    # no rows at all, pull the whole window from EODHD.
+    eodhd_start = (fr_ceiling + timedelta(days=1)).date() if fr_ceiling else (
+        start.date() if isinstance(start, datetime) else start
+    )
+    eodhd_end = end.date() if isinstance(end, datetime) else end
+    if eodhd_start <= eodhd_end:
+        # Original ticker (with $) → normalized inside eodhd_prices
+        recent = eodhd_prices.get_eod(
+            f"${symbol}",
+            from_date=eodhd_start,
+            to_date=eodhd_end,
+            session=eodhd_session,
+        )
+        for r in recent:
+            try:
+                dt = datetime.fromisoformat(r["date"])
+            except (KeyError, ValueError):
+                continue
+            bars.append({
+                "datetime": dt,
+                "open":     float(r.get("open")  or 0),
+                "high":     float(r.get("high")  or 0),
+                "low":      float(r.get("low")   or 0),
+                "close":    float(r.get("close") or 0),
+                "source":   "eodhd",
+            })
+    # Re-sort just in case EODHD overlapped firstrate by a day
+    bars.sort(key=lambda b: b["datetime"])
+    # De-dup on date
+    seen = set()
+    deduped = []
+    for b in bars:
+        d = b["datetime"].date() if isinstance(b["datetime"], datetime) else b["datetime"]
+        if d in seen:
+            continue
+        seen.add(d)
+        deduped.append(b)
+    return deduped
+
+
+def fetch_quote(ticker: str, *, session=None) -> dict | None:
+    """Most-recent live quote via EODHD. Returns
+    `{datetime, close, ...}` or None on error / no key / no coverage."""
+    q = eodhd_prices.get_quote(ticker, session=session)
+    if not q:
+        return None
+    # EODHD timestamp is unix seconds
+    ts = q.get("timestamp")
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc) if ts else None
+    return {
+        "datetime":   dt,
+        "open":       q.get("open"),
+        "high":       q.get("high"),
+        "low":        q.get("low"),
+        "close":      q.get("close"),
+        "previousClose": q.get("previousClose"),
+        "source":     "eodhd-live",
+    }
 
 
 def compute_outcome(*, direction: str | None,
@@ -162,8 +243,20 @@ def compute_outcome(*, direction: str | None,
 
 
 def enrich_thread(thread_id: str, *, con=None,
-                   firstrate_con=None) -> dict:
-    """Update one thread's outcome fields. Returns the updated row dict."""
+                   firstrate_con=None,
+                   splice_eodhd: bool = True,
+                   eodhd_session=None,
+                   use_live_quote: bool = True) -> dict:
+    """Update one thread's outcome fields. Returns the updated row dict.
+
+    `splice_eodhd` controls whether to call out to EODHD for the recent
+    portion of the bar history (after firstrate's ceiling). `use_live_quote`
+    further uses EODHD's real-time endpoint to overwrite the last_mark_price
+    with the most-current close (vs the most recent bar's close, which is
+    yesterday's at best).
+
+    Both default True; tests inject a stub session to avoid network calls.
+    """
     own_con = con is None
     if own_con:
         ctl.ensure_schema()
@@ -191,15 +284,24 @@ def enrich_thread(thread_id: str, *, con=None,
         # firstrate stores naive datetimes; align by stripping tz
         opened_naive = opened_at.replace(tzinfo=None) if opened_at.tzinfo else opened_at
         end = datetime.now()
-        bars = fetch_bars(symbol, start=opened_naive, end=end, con=firstrate_con)
+        bars = fetch_bars(symbol, start=opened_naive, end=end,
+                           con=firstrate_con,
+                           splice_eodhd=splice_eodhd,
+                           eodhd_session=eodhd_session)
         if not bars:
             return thread  # no coverage → leave as-is
 
-        # Use entry_price_actual if already known, else first bar's open
-        entry_price = thread.get("entry_price_actual")
-        if entry_price is None:
-            # Pull first bar; entry_price_actual = open of that bar
-            entry_price = bars[0]["open"]
+        # Entry price priority:
+        #   1. entry_price_actual (already set by a previous enrich pass)
+        #   2. current_entry_price (LLM extracted from post text — most
+        #      faithful to "what the author called as the entry")
+        #   3. bars[0].open (firstrate/EODHD open of the post-bar — a
+        #      reasonable proxy when the post said "L here")
+        entry_price = (
+            thread.get("entry_price_actual")
+            or thread.get("current_entry_price")
+            or bars[0]["open"]
+        )
         # current_stop_price / current_target_price drive auto-close
         stop_price   = thread.get("current_stop_price")
         target_price = thread.get("current_target_price")
@@ -213,10 +315,29 @@ def enrich_thread(thread_id: str, *, con=None,
         if not outcome:
             return thread
 
+        # Optionally overwrite last_mark with a live quote (more current
+        # than the most recent EOD bar)
+        if use_live_quote and "closed_at" not in outcome:
+            live = fetch_quote(ticker, session=eodhd_session)
+            if live and live.get("close"):
+                sign = 1.0 if direction == "long" else -1.0
+                outcome["last_mark_price"] = live["close"]
+                outcome["last_mark_at"]    = live["datetime"] or outcome.get("last_mark_at")
+                outcome["current_pnl_pct"] = round(
+                    100 * sign * (live["close"] - entry_price) / entry_price, 4
+                )
+
         days_held = None
         if outcome.get("last_mark_at") and bars:
             try:
-                days_held = (outcome["last_mark_at"] - bars[0]["datetime"]).days
+                lm = outcome["last_mark_at"]
+                first = bars[0]["datetime"]
+                # Strip tz to compare apples-to-apples
+                if hasattr(lm, "tzinfo") and lm.tzinfo:
+                    lm = lm.replace(tzinfo=None)
+                if hasattr(first, "tzinfo") and first.tzinfo:
+                    first = first.replace(tzinfo=None)
+                days_held = (lm - first).days
             except (TypeError, AttributeError):
                 pass
 
@@ -262,8 +383,14 @@ def enrich_thread(thread_id: str, *, con=None,
             con.close()
 
 
-def enrich_all_open(*, stale_days: int = ctl_threads.CTL_STALE_DAYS) -> dict:
-    """Run enrich_thread over all open|partial threads. Auto-mark stale."""
+def enrich_all_open(*, stale_days: int = ctl_threads.CTL_STALE_DAYS,
+                     splice_eodhd: bool = True,
+                     use_live_quote: bool = True,
+                     eodhd_session=None) -> dict:
+    """Run enrich_thread over all open|partial threads. Auto-mark stale.
+
+    `splice_eodhd=False` and `use_live_quote=False` together turn this
+    into a firstrate-only pass (no network), useful for offline runs."""
     ctl.ensure_schema()
     con = ctl._con()
     firstrate_con = duckdb.connect(str(FIRSTRATE_DB), read_only=True) \
@@ -292,7 +419,11 @@ def enrich_all_open(*, stale_days: int = ctl_threads.CTL_STALE_DAYS) -> dict:
                     summary["skipped_futures"] += 1
                     continue
                 before = ctl_threads._read_thread(con, thread_id)
-                after = enrich_thread(thread_id, con=con, firstrate_con=firstrate_con)
+                after = enrich_thread(thread_id, con=con,
+                                       firstrate_con=firstrate_con,
+                                       splice_eodhd=splice_eodhd,
+                                       use_live_quote=use_live_quote,
+                                       eodhd_session=eodhd_session)
                 if not after.get("last_mark_price"):
                     summary["no_data"] += 1
                 else:
