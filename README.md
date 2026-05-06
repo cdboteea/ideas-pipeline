@@ -50,12 +50,33 @@ ideas promote-direct --title "..." --category <cat> --summary "..." --source-typ
 | Script | Launchd agent | Cadence | Captures |
 |---|---|---|---|
 | `poll_gmail_tostage.py` | `com.matias.ideas-gmail-tostage` | 09:00 / 13:00 / 17:00 | Gmail messages with label `ToStage`; strips label after staging |
-| `poll_x_bookmarks.py` | `com.matias.ideas-x-bookmarks` | Daily 09:30 | X bookmarks via `bird` CLI |
+| `poll_x_bookmarks.py` | `com.matias.ideas-x-bookmarks` | Daily 09:30 | X bookmarks via `bird` CLI (`@clawdbot59030` — bot account only) |
+| `poll_x_bookmarks_personal.py` | _in-session, no plist yet_ | Manual / on-trigger | Personal-X bookmarks via Claude-in-Chrome on `x.com/i/bookmarks` |
 | `poll_pdf_dropfolder.py` | `com.matias.ideas-pdf-dropfolder` | Every 30 min, 08-22 | PDFs landing in `~/Downloads/ToStage/` (text-extracted, file moved to `_staged/`) |
 | `poll_telegram_queue.py` | `com.matias.ideas-telegram-queue` | Every 15 min | Drains `~/clawd/data/telegram-queue.jsonl` — spec: `~/clawd/docs/openclaw-telegram-bridge.md` |
 | `ingest_obsidian_to_graphiti.py` | `com.matias.ideas-graphiti-ingest` | Nightly 03:00 | Promoted notes → graphiti KG (limit 25/run, mtime+size dedup) |
 
 Every poller supports `--dry-run`, `--json`, and isolates per-item errors so one bad entry doesn't abort the batch.
+
+### Personal-X bookmarks workflow
+
+Bird runs on `@clawdbot59030` (a suspended bot account, structurally read-only). It cannot see Matias's personal bookmarks. The personal path uses Claude-in-Chrome on the running Chrome (Matias's personal X session lives in cookies there) and a separate state file (`~/clawd/data/x-bookmarks-personal-state.json`) so the two paths never poison each other's dedup.
+
+Two-step capture (in-session today; cron-ified once Chrome MCP transport stabilizes — see `~/projects/citrini-pipeline` task #128):
+
+```bash
+# 1. In a CC session with Chrome MCP attached:
+#    - Navigate Chrome to https://x.com/i/bookmarks
+#    - (scroll-load any older bookmarks you want captured)
+#    - Run the capture JS via `mcp__Claude_in_Chrome__javascript_tool`:
+poll_x_bookmarks_personal.py --print-capture-js
+#    - Save the returned JSON to /tmp/x-bookmarks-capture.json
+
+# 2. Diff vs personal-state and stage to Inbox
+poll_x_bookmarks_personal.py /tmp/x-bookmarks-capture.json [--dry-run] [--json]
+```
+
+The capture JS strips `@` prefixes from handles to bypass the Chrome MCP response filter (which heuristics `@user` patterns as sensitive); `normalize_capture` rebuilds the canonical `@handle` on the Python side.
 
 ## Auto-archive
 
@@ -92,12 +113,13 @@ ideas/
 └── storage.py        # markdown + YAML frontmatter I/O
 scripts/
 ├── poll_gmail_tostage.py
-├── poll_x_bookmarks.py
+├── poll_x_bookmarks.py            # bird-based — bot account
+├── poll_x_bookmarks_personal.py   # Claude-in-Chrome — Matias's personal X
 ├── poll_pdf_dropfolder.py
 ├── poll_telegram_queue.py
 ├── ingest_obsidian_to_graphiti.py
 └── launchagents/     # plist mirrors (source of truth is ~/Library/LaunchAgents)
-tests/                # 37 behavioral tests
+tests/                # 51 behavioral tests
 ```
 
 ## Links
