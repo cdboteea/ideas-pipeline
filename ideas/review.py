@@ -1,5 +1,6 @@
 """Review: interactive Inbox review — promote / discard / defer / edit-and-promote."""
 from __future__ import annotations
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, Optional
@@ -7,6 +8,39 @@ import re
 
 from .config import INBOX, AUTO_ARCHIVE_DAYS
 from .storage import list_inbox, read_inbox_item, move_to_archive, _load_md, _write_md
+
+
+# Tracks when the user last opened a review session. Used by
+# `ideas inbox-status --since-last-review` and the session-start surfacing
+# primitive — items captured AFTER this timestamp count as "new since last
+# review", items deferred AFTER count as "discussed but not promoted".
+LAST_REVIEW_FILE = Path.home() / "clawd" / "data" / "ideas-last-review.json"
+
+
+def get_last_review_at() -> Optional[datetime]:
+    """Return the timestamp of the user's last review-session start, or None."""
+    if not LAST_REVIEW_FILE.exists():
+        return None
+    try:
+        data = json.loads(LAST_REVIEW_FILE.read_text())
+        ts = data.get("last_review_at")
+        if not ts:
+            return None
+        return datetime.fromisoformat(ts)
+    except (ValueError, json.JSONDecodeError):
+        return None
+
+
+def mark_review_now(state_file: Path = None) -> datetime:
+    """Update LAST_REVIEW_FILE to 'right now'. Called when an interactive
+    review session begins."""
+    target = state_file or LAST_REVIEW_FILE
+    now = datetime.now().astimezone()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({
+        "last_review_at": now.isoformat(timespec="seconds"),
+    }, indent=2))
+    return now
 
 
 def iter_pending(
@@ -49,6 +83,63 @@ def inbox_summary() -> dict:
         "by_source_type": counts,
         "oldest": oldest,
         "newest": newest,
+    }
+
+
+def inbox_status(since_last_review: bool = False,
+                  source_type: Optional[str] = None,
+                  state_file: Path = None) -> dict:
+    """
+    Returns a session-start-friendly summary of the Inbox:
+
+      {
+        "new":        N,    # captured AFTER last_review_at (or all, if no last review yet)
+        "deferred":   N,    # last_touched AFTER last_review_at (we discussed it, no decision yet)
+        "untouched":  N,    # captured BEFORE last_review_at AND no last_touched (truly stale)
+        "total":      N,
+        "since":      ISO timestamp of the divider, or null if no last review,
+        "by_source":  { "x-post": ..., "url": ..., ... }   # for "new" only
+      }
+
+    When `since_last_review=False`, returns total Inbox state with no slicing.
+    """
+    last = get_last_review_at() if since_last_review else None
+    last_iso = last.isoformat(timespec="seconds") if last else None
+
+    counters = {"new": 0, "deferred": 0, "untouched": 0, "total": 0}
+    by_source: dict[str, int] = {}
+
+    for path, fm in iter_pending(source_type=source_type):
+        counters["total"] += 1
+        cap = fm.get("captured_at") or ""
+        touched = fm.get("last_touched") or ""
+
+        if not since_last_review or not last:
+            counters["new"] += 1
+            st = fm.get("source_type", "unknown")
+            by_source[st] = by_source.get(st, 0) + 1
+            continue
+
+        # With a last_review_at divider:
+        captured_after = cap > last_iso if cap else False
+        touched_after = touched > last_iso if touched else False
+
+        if captured_after:
+            counters["new"] += 1
+            st = fm.get("source_type", "unknown")
+            by_source[st] = by_source.get(st, 0) + 1
+        elif touched_after:
+            counters["deferred"] += 1
+        else:
+            counters["untouched"] += 1
+
+    return {
+        "new":        counters["new"],
+        "deferred":   counters["deferred"],
+        "untouched":  counters["untouched"],
+        "total":      counters["total"],
+        "since":      last_iso,
+        "by_source":  by_source,
     }
 
 

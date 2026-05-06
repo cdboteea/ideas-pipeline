@@ -145,6 +145,118 @@ def review_auto_archive_cmd() -> None:
         click.echo(f"  {p}")
 
 
+@review.command("interactive")
+@click.option("--source-type", default=None, type=click.Choice(SOURCE_TYPES),
+              help="Filter to one source type (x-post, url, pdf, …).")
+@click.option("--since-last-review", is_flag=True,
+              help="Skip items captured before, or already deferred during, the last review session.")
+@click.option("--limit", default=None, type=int, help="Stop after N items.")
+@click.option("--no-mark", is_flag=True,
+              help="Don't bump last_review_at on session start (use for dry-runs).")
+def review_interactive_cmd(source_type: str | None, since_last_review: bool,
+                            limit: int | None, no_mark: bool) -> None:
+    """Interactive loop over pending Inbox items: [P]/[D]/[F]/[S]/[Q]."""
+    from .storage import read_inbox_item
+
+    last = rev_mod.get_last_review_at() if since_last_review else None
+    last_iso = last.isoformat(timespec="seconds") if last else None
+
+    items = []
+    for path, fm in rev_mod.iter_pending(source_type=source_type):
+        if since_last_review and last_iso:
+            cap = fm.get("captured_at") or ""
+            touched = fm.get("last_touched") or ""
+            if (touched and touched > last_iso) or (cap and cap <= last_iso):
+                continue
+        items.append((path, fm))
+        if limit and len(items) >= limit:
+            break
+
+    if not items:
+        click.echo("Nothing to review. ✓")
+        return
+
+    if not no_mark:
+        rev_mod.mark_review_now()
+
+    click.echo(f"# Reviewing {len(items)} item(s)\n")
+    for i, (path, fm) in enumerate(items, 1):
+        click.echo("─" * 70)
+        click.echo(f"[{i}/{len(items)}]  {path.name}")
+        click.echo(f"  source: {fm.get('source_type','?')}  |  captured: {fm.get('captured_at','?')}")
+        if fm.get("source_url"):
+            click.echo(f"  url:    {fm['source_url']}")
+        if fm.get("source_author"):
+            click.echo(f"  author: {fm['source_author']}")
+        if fm.get("title_hint"):
+            click.echo(f"  title:  {fm['title_hint']}")
+        if fm.get("defer_note"):
+            click.echo(f"  prior defer note: {fm['defer_note']}")
+        try:
+            _, body = read_inbox_item(path)
+        except Exception:
+            body = ""
+        preview = (body or "").strip().replace("\n", " ")[:200]
+        if preview:
+            click.echo(f"  preview: {preview}")
+        click.echo()
+        action = click.prompt("  [P]romote / [D]iscard / [F]efer / [S]kip / [Q]uit",
+                              default="s", show_default=False).strip().lower()
+        if action.startswith("q"):
+            click.echo("\nStopping review.")
+            return
+        if action.startswith("p"):
+            click.echo("  → To promote, run:")
+            click.echo(f"     ideas promote {path} --category <cat> --title \"…\" \\")
+            click.echo("       --summary \"…\" --tags \"a,b,c\"")
+            click.echo("    (the assistant should now classify + run the promote command)")
+        elif action.startswith("d"):
+            dest = rev_mod.discard(path)
+            click.echo(f"  ✓ discarded → {dest}")
+        elif action.startswith("f"):
+            note = click.prompt("    defer note (optional)", default="", show_default=False)
+            rev_mod.defer(path, note=note)
+            click.echo("  ✓ deferred (last_touched bumped)")
+        else:
+            click.echo("  ⊙ skipped")
+    click.echo("\nReview session complete.")
+
+
+@cli.command("inbox-status")
+@click.option("--since-last-review", is_flag=True,
+              help="Slice into 'new since last review' / 'deferred' / 'untouched'.")
+@click.option("--source-type", default=None, type=click.Choice(SOURCE_TYPES),
+              help="Filter to one source type (x-post, url, pdf, …).")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of text.")
+def inbox_status_cmd(since_last_review: bool, source_type: str | None, as_json: bool) -> None:
+    """Session-start surfacing — 'you have N new bookmarks since last review …'.
+
+    Designed for the session-start protocol in CLAUDE.md to call. JSON output
+    is stable for scripting.
+    """
+    s = rev_mod.inbox_status(since_last_review=since_last_review,
+                              source_type=source_type)
+    if as_json:
+        click.echo(json.dumps(s, indent=2))
+        return
+    if since_last_review:
+        if s["since"]:
+            click.echo(f"# Since last review at {s['since']}")
+            click.echo(f"  new:        {s['new']}")
+            click.echo(f"  deferred:   {s['deferred']}  (touched but not promoted)")
+            click.echo(f"  untouched:  {s['untouched']}")
+            click.echo(f"  total:      {s['total']}")
+        else:
+            click.echo("# No prior review session recorded.")
+            click.echo(f"  total pending: {s['total']}")
+    else:
+        click.echo(f"# Inbox status — {s['total']} pending")
+    if s["by_source"]:
+        click.echo("  by source (new):")
+        for st, n in sorted(s["by_source"].items(), key=lambda x: -x[1]):
+            click.echo(f"    {st:12s}  {n}")
+
+
 # ── promote ──────────────────────────────────────────────────────────────────
 
 
