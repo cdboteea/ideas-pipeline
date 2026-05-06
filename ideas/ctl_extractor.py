@@ -98,6 +98,111 @@ CREATE TABLE IF NOT EXISTS trade_ideas (
 CREATE INDEX IF NOT EXISTS idx_trade_ideas_posted_at ON trade_ideas(posted_at);
 CREATE INDEX IF NOT EXISTS idx_trade_ideas_author    ON trade_ideas(author_handle);
 CREATE INDEX IF NOT EXISTS idx_trade_ideas_ticker    ON trade_ideas(ticker);
+
+-- v2: thread linkage (added by ALTER if upgrading from v1)
+CREATE TABLE IF NOT EXISTS trade_threads (
+    thread_id            TEXT PRIMARY KEY,
+    author               TEXT NOT NULL,
+    ticker               TEXT NOT NULL,
+    direction            TEXT,                 -- long | short | unknown
+    state                TEXT NOT NULL,        -- open | partial | closed | stale | unknown
+    opened_at            TIMESTAMP NOT NULL,
+    last_update_at       TIMESTAMP NOT NULL,
+    closed_at            TIMESTAMP,
+
+    -- Rolling current-known state (last non-null wins as posts roll in)
+    current_entry_text   TEXT,
+    current_entry_price  DOUBLE,
+    current_stop_text    TEXT,
+    current_stop_price   DOUBLE,
+    current_target_text  TEXT,
+    current_target_price DOUBLE,
+    current_horizon      TEXT,
+    post_count           INTEGER DEFAULT 0,
+
+    -- Outcome (populated by enrich_outcomes)
+    entry_price_actual   DOUBLE,
+    last_mark_price      DOUBLE,
+    last_mark_at         TIMESTAMP,
+    mfe_pct              DOUBLE,
+    mae_pct              DOUBLE,
+    current_pnl_pct      DOUBLE,
+    days_held            DOUBLE,
+    closed_pnl_pct       DOUBLE,
+    closed_reason        TEXT,                 -- stop_hit | target_hit | explicit_close | stale | unknown
+
+    notes                TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_threads_author     ON trade_threads(author);
+CREATE INDEX IF NOT EXISTS idx_threads_ticker     ON trade_threads(ticker);
+CREATE INDEX IF NOT EXISTS idx_threads_state      ON trade_threads(state);
+CREATE INDEX IF NOT EXISTS idx_threads_open_lookup ON trade_threads(author, ticker, state);
+
+-- v2: alert de-dup log
+CREATE TABLE IF NOT EXISTS ctl_alert_log (
+    alert_id   TEXT PRIMARY KEY,
+    thread_id  TEXT NOT NULL,
+    event_type TEXT NOT NULL,                  -- new_thread | update | stop_warning | target_hit | stop_hit | thread_closed | thread_stale
+    alerted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    channel    TEXT,                           -- telegram | log
+    payload    TEXT                            -- JSON of what was sent
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_log_thread ON ctl_alert_log(thread_id);
+CREATE INDEX IF NOT EXISTS idx_alert_log_event  ON ctl_alert_log(event_type, alerted_at);
+
+-- v2: analytics views (idempotent)
+CREATE OR REPLACE VIEW ctl_author_hit_rate AS
+SELECT
+    author,
+    COUNT(*)                                                   AS thread_count,
+    SUM(CASE WHEN state = 'closed' THEN 1 ELSE 0 END)          AS closed_threads,
+    SUM(CASE WHEN state IN ('open','partial') THEN 1 ELSE 0 END) AS open_threads,
+    SUM(CASE WHEN state = 'closed' AND closed_pnl_pct > 0 THEN 1 ELSE 0 END) AS winners,
+    SUM(CASE WHEN state = 'closed' AND closed_pnl_pct <= 0 THEN 1 ELSE 0 END) AS losers,
+    ROUND(AVG(CASE WHEN state = 'closed' THEN closed_pnl_pct END), 3) AS avg_closed_pnl_pct,
+    ROUND(MEDIAN(CASE WHEN state = 'closed' THEN closed_pnl_pct END), 3) AS median_closed_pnl_pct,
+    ROUND(AVG(CASE WHEN state = 'closed' THEN days_held END), 2)        AS avg_days_held,
+    ROUND(100.0 * SUM(CASE WHEN state = 'closed' AND closed_pnl_pct > 0 THEN 1 ELSE 0 END)
+                  / NULLIF(SUM(CASE WHEN state = 'closed' THEN 1 ELSE 0 END), 0), 1) AS win_pct
+FROM trade_threads
+GROUP BY author;
+
+CREATE OR REPLACE VIEW ctl_ticker_outcomes AS
+SELECT
+    ticker,
+    direction,
+    COUNT(*)                                                   AS thread_count,
+    SUM(CASE WHEN state = 'closed' THEN 1 ELSE 0 END)          AS closed_threads,
+    ROUND(AVG(CASE WHEN state = 'closed' THEN closed_pnl_pct END), 3) AS avg_closed_pnl_pct,
+    ROUND(AVG(CASE WHEN state = 'closed' THEN mfe_pct END), 3)        AS avg_mfe_pct,
+    ROUND(AVG(CASE WHEN state = 'closed' THEN mae_pct END), 3)        AS avg_mae_pct,
+    ROUND(AVG(CASE WHEN state = 'closed' THEN days_held END), 2)      AS avg_days_held
+FROM trade_threads
+GROUP BY ticker, direction
+HAVING COUNT(*) > 0;
+
+CREATE OR REPLACE VIEW ctl_recent_winners AS
+SELECT thread_id, author, ticker, direction, opened_at, closed_at,
+       closed_pnl_pct, mfe_pct, mae_pct, days_held, closed_reason
+FROM trade_threads
+WHERE state = 'closed' AND closed_pnl_pct > 0
+ORDER BY closed_at DESC;
+
+CREATE OR REPLACE VIEW ctl_recent_losers AS
+SELECT thread_id, author, ticker, direction, opened_at, closed_at,
+       closed_pnl_pct, mfe_pct, mae_pct, days_held, closed_reason
+FROM trade_threads
+WHERE state = 'closed' AND closed_pnl_pct <= 0
+ORDER BY closed_at DESC;
+"""
+
+# Idempotent migration: add thread_id to trade_ideas if missing
+_MIGRATION_V1_TO_V2 = """
+ALTER TABLE trade_ideas ADD COLUMN IF NOT EXISTS thread_id TEXT;
+ALTER TABLE trade_ideas ADD COLUMN IF NOT EXISTS thread_intent TEXT;
+CREATE INDEX IF NOT EXISTS idx_trade_ideas_thread ON trade_ideas(thread_id);
 """
 
 
@@ -107,9 +212,20 @@ def _con():
 
 
 def ensure_schema():
+    """Idempotent: creates v1 + v2 tables and runs the v1→v2 migration.
+
+    Safe to call repeatedly. ALTER TABLE … ADD COLUMN IF NOT EXISTS is the
+    DuckDB-native way to add a column without erroring if it already exists.
+    """
     con = _con()
     try:
         con.execute(CTL_SCHEMA_SQL)
+        # Run each migration statement separately (DuckDB requires it for
+        # multi-statement when one is an ALTER).
+        for stmt in _MIGRATION_V1_TO_V2.strip().split(";\n"):
+            stmt = stmt.strip()
+            if stmt:
+                con.execute(stmt)
     finally:
         con.close()
 
@@ -154,6 +270,7 @@ class Classification:
     is_trade_idea:        bool
     classify_confidence:  float
     classify_reason:      str = ""
+    thread_intent:        str = "unsure"   # new | update | close | unsure
 
 
 EXTRACTOR_PROMPT = """\
@@ -169,12 +286,15 @@ A trade idea identifies a specific instrument and at least ONE of:
   - an explicit direction (long, short, "L", "S")
 
 NOT trade ideas: market commentary, philosophy, sector views without
-specifics, position updates ("nice move", "still holding"), reply jokes,
-charts without entries.
+specifics, reply jokes, charts without entries.
+
+POSITION UPDATES count as trade ideas if they reference a specific instrument
+("$SB_F nice move so far", "$AMD trim 1/4 here", "stopped out of $XYZ").
+Set thread_intent accordingly (see TASK 2.5).
 
 TASK 2 — IF a trade idea, EXTRACT these fields (omit any that aren't stated):
   - ticker: PRESERVE the dollar prefix and futures suffix exactly as written.
-    Examples: "$SB_F", "$AMD", "$SPY", "$BTC".
+    Examples are illustrative only; do NOT hallucinate tickers.
   - direction: "long" or "short". "L" / "buy" / "long" → "long".
                                  "S" / "sell" / "short" → "short".
   - entry_text: the raw phrase ("here", "@408", "1235-40 area", "on dip").
@@ -185,14 +305,28 @@ TASK 2 — IF a trade idea, EXTRACT these fields (omit any that aren't stated):
   - target_price: numeric float.
   - horizon: "H4", "swing", "intraday", "scalp", "long-term", "position",
              or unspecified.
-  - tags: array of any #hashtags in the post (no leading #).
+  - tags: array of any hashtags in the post (no leading #).
   - extract_confidence: 0.0–1.0 reflecting how clear the fields are.
+
+TASK 2.5 — thread_intent: one of "new" | "update" | "close" | "unsure".
+  - "new":    a fresh trade idea (initial entry call). Fields like ticker
+              + direction + entry are typically all present.
+  - "update": commentary on an already-open position ("still long",
+              "nice move", "trim 1/4", "took some profits"). The post
+              REFERENCES an instrument but isn't an initial entry.
+  - "close":  explicit exit / stop-out / fully out / target hit
+              ("stopped out", "out", "done", "fully exited").
+  - "unsure": cannot tell from text alone. Default to "unsure" rather
+              than guessing.
+
+If is_trade_idea is false, set thread_intent to "unsure".
 
 OUTPUT FORMAT — STRICT JSON ONLY, no prose around it:
 {
   "is_trade_idea":      <bool>,
   "classify_confidence": <0.0-1.0>,
   "classify_reason":    "<short reason>",
+  "thread_intent":      "new" | "update" | "close" | "unsure",
   "extraction":         { ... } | null
 }
 
@@ -275,10 +409,14 @@ def classify_and_extract(post_text: str, *, llm_call=None,
     raw = llm_call(prompt)
     data = parse_llm_response(raw)
 
+    intent = (data.get("thread_intent") or "unsure").lower().strip()
+    if intent not in {"new", "update", "close", "unsure"}:
+        intent = "unsure"
     cls = Classification(
         is_trade_idea=bool(data.get("is_trade_idea", False)),
         classify_confidence=float(data.get("classify_confidence", 0.0)),
         classify_reason=str(data.get("classify_reason", "")),
+        thread_intent=intent,
     )
     if not cls.is_trade_idea:
         return cls, None
@@ -392,6 +530,64 @@ def upsert_idea(*, tweet_id: str, posted_at, author_handle: str, raw_text: str,
         con.close()
 
 
+def _emit_thread_alert(action: str, thread_id: str, thread_state: dict,
+                         cls: "Classification", idea: "ExtractedIdea",
+                         ctl_threads_mod) -> None:
+    """Map a (action, idea, thread_state) tuple to the right alert event,
+    if any. action is the return from upsert_thread_for_post:
+        opened_new | stale_then_opened_new | appended_to_open
+        | closed_existing | closed_orphan | skipped_no_thread
+
+    Only fires alerts for fresh ideas + significant updates; commentary
+    that just rolled into an open thread without changing key fields
+    doesn't.
+    """
+    direction_label = (idea.direction or "?")[:1].upper()
+    base_summary = (f"{idea.ticker} {direction_label} @{thread_state.get('author','?')}"
+                     f" — {idea.entry_text or '?'}"
+                     f" / S:{idea.stop_text or '—'}"
+                     f" / T:{idea.target_text or '—'}")
+
+    if action in ("opened_new", "stale_then_opened_new"):
+        event_type = "new_thread"
+        summary = "🆕 " + base_summary
+    elif action in ("closed_existing", "closed_orphan"):
+        event_type = "thread_closed"
+        summary = "🚪 close — " + base_summary
+    elif action == "appended_to_open":
+        # Only alert on substantive updates: a NEW stop/target/entry value
+        # shows up vs prior state. (Commentary "nice move" doesn't change
+        # any field — it just bumps post_count + last_update_at.)
+        prior = (thread_state.get("post_count") or 1) - 1
+        substantive = bool(
+            idea.entry_text or idea.stop_text or idea.target_text or idea.direction
+        )
+        if prior == 0 or not substantive:
+            return  # no alert for trivial updates
+        event_type = "update"
+        summary = "📌 update — " + base_summary
+    else:
+        return
+
+    payload = {
+        "thread_id":   thread_id,
+        "ticker":      idea.ticker,
+        "direction":   idea.direction,
+        "entry_text":  idea.entry_text,
+        "stop_text":   idea.stop_text,
+        "target_text": idea.target_text,
+        "horizon":     idea.horizon,
+        "confidence":  idea.extract_confidence,
+        "action":      action,
+    }
+    ctl_threads_mod.maybe_alert(
+        ctl_threads_mod.AlertEvent(
+            thread_id=thread_id, event_type=event_type,
+            summary=summary, payload=payload,
+        )
+    )
+
+
 def list_recent_ideas(limit: int = 20) -> list[dict]:
     ensure_schema()
     con = _con()
@@ -418,9 +614,20 @@ def list_recent_ideas(limit: int = 20) -> list[dict]:
 
 def process_posts(posts: list[dict], *, dry_run: bool = False,
                    llm_call=None, model: str | None = None,
-                   state_file: Path = CTL_STATE_FILE) -> dict:
-    """Run capture → classify → extract → persist over a list of normalized
-    post dicts (shape from ideas.x_personal.normalize_capture)."""
+                   state_file: Path = CTL_STATE_FILE,
+                   thread_link: bool = True,
+                   emit_alerts: bool = True) -> dict:
+    """Run capture → classify → extract → persist → thread-link → alert
+    over a list of normalized post dicts (shape from
+    ideas.x_personal.normalize_capture).
+
+    `thread_link=True` (default) populates `trade_ideas.thread_id` and
+    creates/updates `trade_threads`.
+    `emit_alerts=True` (default) routes new-thread/update events to the
+    log-only alert channel via ideas.ctl_threads.maybe_alert.
+    """
+    # Import here to avoid module-load cycle (ctl_threads imports ctl_extractor)
+    from . import ctl_threads
     state = load_state(state_file)
     seen = set(state.get("processed_ids", []))
 
@@ -482,11 +689,29 @@ def process_posts(posts: list[dict], *, dry_run: bool = False,
             upsert_idea(tweet_id=tid, posted_at=ts, author_handle=author,
                          raw_text=text, cls=cls, idea=idea, llm_model=model)
             seen.add(tid)
+            # Thread linkage + alert (after the post row exists)
+            if thread_link and idea.ticker:
+                try:
+                    thread_id, action, thread_state = \
+                        ctl_threads.upsert_thread_for_post(
+                            tweet_id=tid, posted_at=ts,
+                            author=author, ticker=idea.ticker,
+                            cls=cls, idea=idea,
+                        )
+                    if emit_alerts and thread_id:
+                        _emit_thread_alert(action, thread_id, thread_state,
+                                            cls, idea, ctl_threads)
+                except Exception as e:  # noqa: BLE001
+                    summary["errors"].append({
+                        "tweet_id": tid,
+                        "error":    f"thread/alert: {type(e).__name__}: {e}",
+                    })
         summary["ideas"].append({
             "tweet_id": tid, "author": author, "ticker": idea.ticker,
             "direction": idea.direction, "entry": idea.entry_text,
             "stop": idea.stop_text, "target": idea.target_text,
             "horizon": idea.horizon, "confidence": idea.extract_confidence,
+            "thread_intent": cls.thread_intent,
         })
 
     summary["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")

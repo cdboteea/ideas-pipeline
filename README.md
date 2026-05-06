@@ -52,7 +52,8 @@ ideas promote-direct --title "..." --category <cat> --summary "..." --source-typ
 | `poll_gmail_tostage.py` | `com.matias.ideas-gmail-tostage` | 09:00 / 13:00 / 17:00 | Gmail messages with label `ToStage`; strips label after staging |
 | `poll_x_bookmarks.py` | `com.matias.ideas-x-bookmarks` | Daily 09:30 | X bookmarks via `bird` CLI (`@clawdbot59030` — bot account only) |
 | `poll_x_bookmarks_personal.py` | _in-session, no plist yet_ | Manual / on-trigger | Personal-X bookmarks via Claude-in-Chrome on `x.com/i/bookmarks` |
-| `poll_ctl_ideas.py` | _in-session, no plist yet_ | Manual / on-trigger | CTL Trading list posts → structured trade ideas (codex/gpt-5 LLM extract) → `~/clawd/data/ctl-trade-ideas.duckdb` |
+| `poll_ctl_ideas.py` | _in-session, no plist yet_ | Manual / on-trigger | CTL Trading list posts → structured trade ideas + thread linkage + alert hook → `~/clawd/data/ctl-trade-ideas.duckdb` |
+| `enrich_ctl_outcomes.py` | _in-session, no plist yet_ | Daily after market close | Walks open CTL threads, fetches firstrate bars, computes MFE/MAE/pnl, auto-closes on stop/target hit, marks 14d-stale |
 | `poll_pdf_dropfolder.py` | `com.matias.ideas-pdf-dropfolder` | Every 30 min, 08-22 | PDFs landing in `~/Downloads/ToStage/` (text-extracted, file moved to `_staged/`) |
 | `poll_telegram_queue.py` | `com.matias.ideas-telegram-queue` | Every 15 min | Drains `~/clawd/data/telegram-queue.jsonl` — spec: `~/clawd/docs/openclaw-telegram-bridge.md` |
 | `ingest_obsidian_to_graphiti.py` | `com.matias.ideas-graphiti-ingest` | Nightly 03:00 | Promoted notes → graphiti KG (limit 25/run, mtime+size dedup) |
@@ -61,7 +62,9 @@ Every poller supports `--dry-run`, `--json`, and isolates per-item errors so one
 
 ### CTL trade-idea extraction workflow
 
-The CTL Trading list (4 members @ `x.com/i/lists/936040010809307136`, owned by @mirvois) ships structured trade ideas (CTLFutures: `$SB_F L here Risk 14.94 H4 #Swing`) and mixed commentary (canuck2usa: `$AMD 408`). The pipeline classifies each post (idea vs commentary) and extracts ticker / direction / entry / stop / target / horizon / tags via codex (gpt-5) running locally over the OpenClaw subscription — no API key needed.
+The CTL Trading list (4 members @ `x.com/i/lists/936040010809307136`, owned by @mirvois) ships structured trade ideas (CTLFutures: `$SB_F L here Risk 14.94 H4 #Swing`) and mixed commentary (canuck2usa: `$AMD 408`). The pipeline classifies each post (idea vs commentary), extracts ticker / direction / entry / stop / target / horizon / tags via codex (gpt-5 over the OpenClaw subscription — no API key needed), groups posts on the same ticker into **trade threads** with state evolution, and computes outcomes (MFE / MAE / pnl, auto-close on stop/target hit) from `firstrate.duckdb`.
+
+#### Daily flow
 
 ```bash
 # 1. In a CC session with Chrome MCP attached:
@@ -70,19 +73,39 @@ The CTL Trading list (4 members @ `x.com/i/lists/936040010809307136`, owned by @
 poll_ctl_ideas.py --print-capture-js
 #    - Save the returned JSON to /tmp/ctl-capture.json
 
-# 2. Classify + extract + persist
+# 2. Classify + extract + thread-link + log alerts
 poll_ctl_ideas.py /tmp/ctl-capture.json [--dry-run] [--json]
 
-# 3. Inspect recent persisted ideas
-poll_ctl_ideas.py --list-recent --limit 20
+# 3. Enrich open threads with MFE/MAE/pnl + auto-close on stop/target
+ideas ctl-enrich   (or `enrich_ctl_outcomes.py` standalone)
+
+# 4. Session-start surfacing
+ideas ctl-status --since-last-check    # what's new + updated + stale-open
+ideas ctl-summary                       # per-author hit-rate + per-ticker pnl
 ```
 
-Storage:
-- `~/clawd/data/ctl-trade-ideas.duckdb` — `trade_ideas` table (idempotent on `tweet_id`)
-- `~/clawd/data/ctl-state.json` — processed-IDs dedup
-- `~/clawd/logs/ctl-trade-ideas.log` — one summary line per fire
+#### Storage
 
-Output schema includes both raw text and parsed numeric prices where extractable, plus the LLM's classification confidence. Telegram notification deferred per design doc; today the log file is the canonical signal channel.
+| Path | What |
+|------|------|
+| `~/clawd/data/ctl-trade-ideas.duckdb` | `trade_ideas` (one row per post) + `trade_threads` (logical trades) + `ctl_alert_log` (de-dup) + analytics views |
+| `~/clawd/data/ctl-state.json` | Processed tweet-ID dedup |
+| `~/clawd/data/ctl-last-check.json` | Per-user last-check divider for `ctl-status --since-last-check` |
+| `~/clawd/logs/ctl-trade-ideas.log` | One summary line per pipeline fire |
+| `~/clawd/logs/ctl-enrich.log` | One summary line per outcome enrichment run |
+| `~/clawd/logs/ctl-alerts.log` | Alert log channel (today). Telegram channel spec'd in design doc, not wired. |
+
+#### Threading logic
+
+Each post asks the LLM for `thread_intent`: `"new" | "update" | "close" | "unsure"`. New + open thread on same `(author, ticker)` exists → mark old stale, open new. Update + open thread → append. Close + open → close. Lookup window default 60 days. Threads with no update >14 days are auto-marked stale by the enrich job. See `~/clawd/research/workflows/ctl-pipeline-v2-2026-05-06.md` for full spec.
+
+#### Coverage notes
+
+Outcome enrichment uses `~/clawd/data/firstrate.duckdb` (daily resolution, monthly-refreshed → ~5 weeks behind today). Equities/ETFs are fully covered; futures (`$SB_F`, `$ZS_F`, `$ES_F`, etc.) are skipped — threads still track post lifecycle, just no MTM. Live-data splice via EODHD is a future enhancement.
+
+#### Alerts (spec'd, log-channel-only today)
+
+The `maybe_alert(thread, event)` hook in `ideas/ctl_threads.py` is the single funnel for new-thread / update / target-hit / stop-hit / thread-stale events. Today routes to `~/clawd/logs/ctl-alerts.log` with per-event-type throttling (60-min minimum interval) and a `ctl_alert_log` de-dup table. The Telegram channel raises `NotImplementedError` until wired — see `~/clawd/research/workflows/ctl-pipeline-v2-2026-05-06.md` §Alerts for the trigger conditions and channel spec.
 
 ### Personal-X bookmarks workflow
 
