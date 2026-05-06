@@ -52,11 +52,37 @@ ideas promote-direct --title "..." --category <cat> --summary "..." --source-typ
 | `poll_gmail_tostage.py` | `com.matias.ideas-gmail-tostage` | 09:00 / 13:00 / 17:00 | Gmail messages with label `ToStage`; strips label after staging |
 | `poll_x_bookmarks.py` | `com.matias.ideas-x-bookmarks` | Daily 09:30 | X bookmarks via `bird` CLI (`@clawdbot59030` — bot account only) |
 | `poll_x_bookmarks_personal.py` | _in-session, no plist yet_ | Manual / on-trigger | Personal-X bookmarks via Claude-in-Chrome on `x.com/i/bookmarks` |
+| `poll_ctl_ideas.py` | _in-session, no plist yet_ | Manual / on-trigger | CTL Trading list posts → structured trade ideas (codex/gpt-5 LLM extract) → `~/clawd/data/ctl-trade-ideas.duckdb` |
 | `poll_pdf_dropfolder.py` | `com.matias.ideas-pdf-dropfolder` | Every 30 min, 08-22 | PDFs landing in `~/Downloads/ToStage/` (text-extracted, file moved to `_staged/`) |
 | `poll_telegram_queue.py` | `com.matias.ideas-telegram-queue` | Every 15 min | Drains `~/clawd/data/telegram-queue.jsonl` — spec: `~/clawd/docs/openclaw-telegram-bridge.md` |
 | `ingest_obsidian_to_graphiti.py` | `com.matias.ideas-graphiti-ingest` | Nightly 03:00 | Promoted notes → graphiti KG (limit 25/run, mtime+size dedup) |
 
 Every poller supports `--dry-run`, `--json`, and isolates per-item errors so one bad entry doesn't abort the batch.
+
+### CTL trade-idea extraction workflow
+
+The CTL Trading list (4 members @ `x.com/i/lists/936040010809307136`, owned by @mirvois) ships structured trade ideas (CTLFutures: `$SB_F L here Risk 14.94 H4 #Swing`) and mixed commentary (canuck2usa: `$AMD 408`). The pipeline classifies each post (idea vs commentary) and extracts ticker / direction / entry / stop / target / horizon / tags via codex (gpt-5) running locally over the OpenClaw subscription — no API key needed.
+
+```bash
+# 1. In a CC session with Chrome MCP attached:
+#    - Navigate Chrome to https://x.com/i/lists/936040010809307136
+#    - Run the capture JS (same as bookmarks):
+poll_ctl_ideas.py --print-capture-js
+#    - Save the returned JSON to /tmp/ctl-capture.json
+
+# 2. Classify + extract + persist
+poll_ctl_ideas.py /tmp/ctl-capture.json [--dry-run] [--json]
+
+# 3. Inspect recent persisted ideas
+poll_ctl_ideas.py --list-recent --limit 20
+```
+
+Storage:
+- `~/clawd/data/ctl-trade-ideas.duckdb` — `trade_ideas` table (idempotent on `tweet_id`)
+- `~/clawd/data/ctl-state.json` — processed-IDs dedup
+- `~/clawd/logs/ctl-trade-ideas.log` — one summary line per fire
+
+Output schema includes both raw text and parsed numeric prices where extractable, plus the LLM's classification confidence. Telegram notification deferred per design doc; today the log file is the canonical signal channel.
 
 ### Personal-X bookmarks workflow
 
