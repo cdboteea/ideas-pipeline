@@ -48,6 +48,15 @@ from typing import Any
 
 import duckdb
 
+# Shared Gemini client (post-codex migration, 2026-05-18). Lazy import so the
+# legacy codex path can still be exercised by tests that inject `llm_call`.
+import sys as _sys
+_sys.path.insert(0, os.path.expanduser("~/clawd/scripts"))
+try:
+    from lib import gemini_client  # type: ignore[import-not-found]
+except ImportError:
+    gemini_client = None
+
 
 # ── Paths ───────────────────────────────────────────────────────────────────
 
@@ -399,16 +408,231 @@ def parse_llm_response(raw: str) -> dict:
     return data
 
 
-def classify_and_extract(post_text: str, *, llm_call=None,
-                          model: str | None = None) -> tuple[Classification, ExtractedIdea | None]:
-    """One LLM round-trip per post. `llm_call` is injected for tests."""
-    if llm_call is None:
-        llm_call = lambda p: call_codex(p, model=model)
-    prompt = (EXTRACTOR_PROMPT + "\n\n--- POST ---\n" + post_text + "\n--- END POST ---\n"
-              "Reply with JSON only.")
-    raw = llm_call(prompt)
-    data = parse_llm_response(raw)
+# JSON schema for a single trade-idea extraction. Used by both the
+# single-post and batch paths.
+_GEMINI_IDEA_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "is_trade_idea": {"type": "boolean"},
+        "classify_confidence": {"type": "number"},
+        "classify_reason": {"type": "string"},
+        "thread_intent": {"type": "string", "enum": ["new", "update", "close", "unsure"]},
+        "extraction": {
+            "type": "object",
+            "properties": {
+                "ticker":       {"type": "string"},
+                "direction":    {"type": "string", "enum": ["long", "short"]},
+                "entry_text":   {"type": "string"},
+                "entry_price":  {"type": "number"},
+                "stop_text":    {"type": "string"},
+                "stop_price":   {"type": "number"},
+                "target_text":  {"type": "string"},
+                "target_price": {"type": "number"},
+                "horizon":      {"type": "string"},
+                "tags":         {"type": "array", "items": {"type": "string"}},
+                "extract_confidence": {"type": "number"},
+            },
+        },
+    },
+    "required": ["is_trade_idea", "classify_confidence", "thread_intent"],
+}
 
+
+def _gemini_extract(post_text: str, model: str | None = None) -> dict:
+    """Default LLM path post-2026-05-18 migration: Gemini Flash with structured
+    output. Returns the same {is_trade_idea, classify_confidence, classify_reason,
+    thread_intent, extraction} dict shape the codex path produced.
+
+    Single-post variant — kept for callers that want one-off extraction.
+    For bulk runs, use `_gemini_extract_batch` (one Gemini call per ~15
+    posts instead of one per post — orders-of-magnitude faster under the
+    free-tier RPM ceiling).
+    """
+    if gemini_client is None:
+        raise RuntimeError("gemini_client unavailable — install google-genai or "
+                           "verify ~/clawd/scripts/lib/gemini_client.py on path")
+
+    prompt = (EXTRACTOR_PROMPT + "\n\n--- POST ---\n" + post_text + "\n--- END POST ---\n")
+    result = gemini_client.extract_structured(
+        prompt, _GEMINI_IDEA_SCHEMA,
+        model=model or gemini_client.DEFAULT_MODEL,
+    )
+    if result is None:
+        raise RuntimeError("gemini extract_structured returned None")
+    return result
+
+
+# Per-batch cap. The CTL idea schema is ~3x the size of the x-general
+# classify schema (nested extraction block), so we use a slightly smaller
+# chunk to keep response tokens under max_output_tokens=2048. 15 fits
+# comfortably and leaves headroom for verbose reasons / longer extractions.
+_GEMINI_BATCH_CHUNK = 15
+
+
+def _gemini_extract_batch(
+    items: list[dict],
+    *,
+    model: str | None = None,
+    chunk_size: int = _GEMINI_BATCH_CHUNK,
+) -> dict[str, dict]:
+    """Batch trade-idea extraction.
+
+    Args:
+        items: list of {"id": str, "text": str} dicts.
+        model: Gemini model id (defaults to gemini_client.DEFAULT_MODEL).
+        chunk_size: posts per Gemini call.
+
+    Returns:
+        {tweet_id: {is_trade_idea, classify_confidence, classify_reason,
+                    thread_intent, extraction}}
+
+        Missing entries (Gemini didn't return a row for that id, OR the call
+        failed entirely) are simply absent from the dict. Caller should
+        treat absence as "skip this post / log an error".
+    """
+    if gemini_client is None:
+        raise RuntimeError("gemini_client unavailable — install google-genai or "
+                           "verify ~/clawd/scripts/lib/gemini_client.py on path")
+    if not items:
+        return {}
+
+    # Wrap the per-post schema in a {results: [...]} envelope.
+    batch_schema = {
+        "type": "object",
+        "properties": {
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id":                  {"type": "string"},
+                        "is_trade_idea":       {"type": "boolean"},
+                        "classify_confidence": {"type": "number"},
+                        "classify_reason":     {"type": "string"},
+                        "thread_intent": {
+                            "type": "string",
+                            "enum": ["new", "update", "close", "unsure"],
+                        },
+                        "extraction": _GEMINI_IDEA_SCHEMA["properties"]["extraction"],
+                    },
+                    "required": ["id", "is_trade_idea", "classify_confidence", "thread_intent"],
+                },
+            },
+        },
+        "required": ["results"],
+    }
+
+    out: dict[str, dict] = {}
+    eff_model = model or gemini_client.DEFAULT_MODEL
+
+    for start in range(0, len(items), chunk_size):
+        chunk = items[start : start + chunk_size]
+        posts_block = "\n\n".join(
+            f'ID: {it["id"]}\nText: """{(it.get("text") or "")[:1500]}"""'
+            for it in chunk
+        )
+        prompt = (
+            EXTRACTOR_PROMPT
+            + "\n\n--- BATCH INPUT ---\n"
+              "You will receive MULTIPLE posts below. For EACH post, return the\n"
+              "same per-post object shape described above, but in a top-level\n"
+              "`results` array. Echo each post's ID exactly in the `id` field.\n"
+              "Do NOT merge, summarize, or skip posts — one result entry per ID.\n\n"
+            + posts_block
+            + "\n--- END BATCH ---\n"
+        )
+        # Higher max_output_tokens for batch — 15 results × ~250 tokens each
+        # comfortably fits under 8192. We also need to override the default
+        # 2048 ceiling baked into extract_structured for the per-post case.
+        raw = _gemini_call_batch(prompt, batch_schema, model=eff_model)
+        if not raw or not isinstance(raw.get("results"), list):
+            continue
+        for r in raw["results"]:
+            if not isinstance(r, dict):
+                continue
+            rid = str(r.get("id") or "").strip()
+            if not rid:
+                continue
+            out[rid] = r
+
+    return out
+
+
+def _gemini_call_batch(prompt: str, schema: dict, *, model: str) -> dict | None:
+    """Variant of gemini_client.extract_structured that uses a bigger output
+    budget for batched calls. We can't pass max_output_tokens through the
+    public client API yet, so we duplicate the small slice of logic here.
+
+    Falls back to the public extract_structured() on any import / setup
+    issue, so a failure here doesn't take the pipeline down.
+    """
+    try:
+        # Inline the call — same retry behavior as the shared client, but
+        # with max_output_tokens widened to 8192.
+        from google.genai import types as gtypes  # type: ignore[import-not-found]
+        import json as _json
+        import re as _re
+        import time as _time
+
+        client = gemini_client._client()  # pylint: disable=protected-access
+        config = gtypes.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=schema,
+            max_output_tokens=8192,
+        )
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                result = client.models.generate_content(
+                    model=model, contents=prompt, config=config,
+                )
+                text = (result.text or "").strip()
+                if not text:
+                    return None
+                return _json.loads(text)
+            except Exception as e:  # noqa: BLE001
+                msg = str(e)
+                is_429 = "RESOURCE_EXHAUSTED" in msg or "429" in msg or "quota" in msg.lower()
+                is_503 = "UNAVAILABLE" in msg or "503" in msg or "high demand" in msg.lower()
+                is_500 = "INTERNAL" in msg or "500" in msg
+                retryable = is_429 or is_503 or is_500
+                if retryable and attempt < max_retries:
+                    if is_429:
+                        # Daily-quota exhaustion can't be retried same-day.
+                        if "PerDay" in msg or "RequestsPerDay" in msg:
+                            logging.getLogger(__name__).warning(
+                                "gemini daily quota exhausted — not retrying",
+                            )
+                            return None
+                        m  = _re.search(r"retry in (\d+(?:\.\d+)?)\s*s", msg)
+                        m2 = _re.search(r"['\"]?retryDelay['\"]?\s*:\s*['\"]?(\d+)s", msg)
+                        delay = float(m.group(1)) if m else (float(m2.group(1)) if m2 else 15.0)
+                        # Respect server-requested delay; cap at 90s to bound
+                        # the worst per-attempt wait.
+                        delay = min(delay + 1.0, 90.0)
+                    else:
+                        delay = min(2.0 * (2 ** attempt), 20.0)
+                    _time.sleep(delay)
+                    continue
+                logging.getLogger(__name__).warning(
+                    "gemini batch call failed: %s", e,
+                )
+                return None
+    except ImportError:
+        # google.genai SDK absent — fall back to the public path (smaller
+        # token budget). Better to truncate than to crash.
+        return gemini_client.extract_structured(prompt, schema, model=model)
+    return None
+
+
+def _parse_extraction_dict(data: dict) -> tuple[Classification, ExtractedIdea | None]:
+    """Convert a raw LLM-output dict (either {is_trade_idea, …, extraction: {…}}
+    shape from a single-post call, or one element of the batch `results`
+    array) into (Classification, ExtractedIdea|None).
+
+    Centralizes the field normalization so the single-post path and the
+    batched path can't drift.
+    """
     intent = (data.get("thread_intent") or "unsure").lower().strip()
     if intent not in {"new", "update", "close", "unsure"}:
         intent = "unsure"
@@ -437,6 +661,36 @@ def classify_and_extract(post_text: str, *, llm_call=None,
         extract_confidence=float(ext.get("extract_confidence", 0.0)),
     )
     return cls, idea
+
+
+def classify_and_extract(post_text: str, *, llm_call=None,
+                          model: str | None = None) -> tuple[Classification, ExtractedIdea | None]:
+    """One LLM round-trip per post. `llm_call` is injected for tests.
+
+    Default path (2026-05-18+): Gemini Flash via the shared client.
+    Legacy path (pre-2026-05-18): codex CLI / gpt-5. Still available via
+    `llm_call=lambda p: call_codex(p)` for testing/comparison.
+
+    Note on `model`: when llm_call is None and model is None, the Gemini
+    client's DEFAULT_MODEL (gemini-2.5-flash-lite) is used. Callers can
+    pass `model="gemini-2.5-flash"` for higher quality at the cost of
+    lower free-tier RPM.
+
+    NB: For bulk runs, `process_posts` uses `_gemini_extract_batch` instead
+    of looping over this function — single-post calls are orders of magnitude
+    slower under the free-tier RPM ceiling.
+    """
+    if llm_call is None:
+        # New default: Gemini Flash with structured output.
+        effective_model = model or (gemini_client.DEFAULT_MODEL if gemini_client else None)
+        data = _gemini_extract(post_text, model=effective_model)
+    else:
+        prompt = (EXTRACTOR_PROMPT + "\n\n--- POST ---\n" + post_text + "\n--- END POST ---\n"
+                  "Reply with JSON only.")
+        raw = llm_call(prompt)
+        data = parse_llm_response(raw)
+
+    return _parse_extraction_dict(data)
 
 
 def _to_float(v: Any) -> float | None:
@@ -631,6 +885,17 @@ def process_posts(posts: list[dict], *, dry_run: bool = False,
     state = load_state(state_file)
     seen = set(state.get("processed_ids", []))
 
+    # Resolve the model tag we'll persist with each row. When the caller
+    # injects llm_call (legacy codex path or test stub), default to
+    # "codex" — there's no Gemini model in play. When using the default
+    # path, fall back to the Gemini client's DEFAULT_MODEL.
+    if llm_call is not None:
+        effective_model = model or "codex"
+    else:
+        effective_model = model or (
+            gemini_client.DEFAULT_MODEL if gemini_client else "unknown"
+        )
+
     summary = {
         "started_at":  datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "fetched":     len(posts),
@@ -642,9 +907,11 @@ def process_posts(posts: list[dict], *, dry_run: bool = False,
         "errors":            [],
         "ideas":             [],
         "dry_run":           dry_run,
-        "model":             model,
+        "model":             effective_model,
     }
 
+    # Pre-filter to unseen posts so we don't waste Gemini tokens on dupes.
+    unseen: list[dict] = []
     for p in posts:
         tid = str(p.get("id") or "")
         if not tid:
@@ -653,12 +920,45 @@ def process_posts(posts: list[dict], *, dry_run: bool = False,
         if tid in seen:
             summary["skipped_seen"] += 1
             continue
+        unseen.append(p)
 
+    # Default (Gemini) path: one batched call per ~15 posts. This brings
+    # 108 tweets from "5+ minutes serial w/ retries" down to "~30 seconds".
+    # The legacy path (when caller injects llm_call) stays per-post — tests
+    # that mock the LLM expect that behavior.
+    batch_results: dict[str, dict] = {}
+    if llm_call is None and unseen:
+        batch_items = [
+            {"id": str(p.get("id")), "text": p.get("text") or ""}
+            for p in unseen
+        ]
+        try:
+            batch_results = _gemini_extract_batch(batch_items, model=effective_model)
+        except Exception as e:  # noqa: BLE001
+            summary["errors"].append({
+                "tweet_id": None,
+                "error":    f"batch_extract: {type(e).__name__}: {e}",
+            })
+            batch_results = {}
+
+    for p in unseen:
+        tid = str(p.get("id") or "")
         text   = p.get("text") or ""
         author = (p.get("author") or {}).get("username") or p.get("handle") or ""
         ts     = p.get("created_at")
+
         try:
-            cls, idea = classify_and_extract(text, llm_call=llm_call, model=model)
+            if llm_call is None:
+                # Default path: pluck the batch result for this id. If Gemini
+                # dropped it (rare), fall back to a single-post call so we
+                # don't silently lose ideas.
+                data = batch_results.get(tid)
+                if data is None:
+                    data = _gemini_extract(text, model=effective_model)
+                cls, idea = _parse_extraction_dict(data)
+            else:
+                # Legacy / test path — per-post LLM call.
+                cls, idea = classify_and_extract(text, llm_call=llm_call, model=model)
         except Exception as e:  # noqa: BLE001
             summary["errors"].append({
                 "tweet_id": tid,
@@ -670,7 +970,8 @@ def process_posts(posts: list[dict], *, dry_run: bool = False,
             summary["classified_skip"] += 1
             if not dry_run:
                 upsert_idea(tweet_id=tid, posted_at=ts, author_handle=author,
-                             raw_text=text, cls=cls, idea=None, llm_model=model)
+                             raw_text=text, cls=cls, idea=None,
+                             llm_model=effective_model)
                 seen.add(tid)
             continue
 
@@ -687,7 +988,8 @@ def process_posts(posts: list[dict], *, dry_run: bool = False,
         summary["extracted_valid"] += 1
         if not dry_run:
             upsert_idea(tweet_id=tid, posted_at=ts, author_handle=author,
-                         raw_text=text, cls=cls, idea=idea, llm_model=model)
+                         raw_text=text, cls=cls, idea=idea,
+                         llm_model=effective_model)
             seen.add(tid)
             # Thread linkage + alert (after the post row exists)
             if thread_link and idea.ticker:
