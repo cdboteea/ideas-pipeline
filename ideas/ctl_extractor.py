@@ -713,7 +713,18 @@ def _gemini_call_batch(prompt: str, schema: dict, *, model: str) -> dict | None:
 
     Falls back to the public extract_structured() on any import / setup
     issue, so a failure here doesn't take the pipeline down.
+
+    Honors the soft free-tier-equivalent RPD limit (see
+    `gemini_client.check_rpd`) — refuses the call BEFORE hitting the API
+    if today's per-model budget is depleted. Set GEMINI_RPD_LIMIT=0 in env
+    to disable.
     """
+    try:
+        gemini_client.check_rpd(model)
+    except gemini_client.GeminiRPDExceeded as e:
+        logging.getLogger(__name__).warning("%s", e)
+        return None
+
     try:
         # Inline the call — same retry behavior as the shared client, but
         # with max_output_tokens widened to 8192.
@@ -734,6 +745,7 @@ def _gemini_call_batch(prompt: str, schema: dict, *, model: str) -> dict | None:
                 result = client.models.generate_content(
                     model=model, contents=prompt, config=config,
                 )
+                gemini_client._increment_rpd(model)  # pylint: disable=protected-access
                 text = (result.text or "").strip()
                 if not text:
                     return None
