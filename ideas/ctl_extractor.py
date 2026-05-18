@@ -725,6 +725,10 @@ def _gemini_call_batch(prompt: str, schema: dict, *, model: str) -> dict | None:
         logging.getLogger(__name__).warning("%s", e)
         return None
 
+    # Pace under the free-tier RPM ceiling. Matches describe-frames-gemini.py
+    # cadence pattern (proven on free tier for ~5K daily frame descriptions).
+    gemini_client._pace_call(model)  # pylint: disable=protected-access
+
     try:
         # Inline the call — same retry behavior as the shared client, but
         # with max_output_tokens widened to 8192.
