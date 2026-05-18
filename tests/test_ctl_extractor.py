@@ -17,10 +17,12 @@ from ideas.ctl_extractor import (
     Classification,
     ExtractedIdea,
     classify_and_extract,
+    classify_and_extract_all,
     parse_llm_response,
     is_valid_idea,
     process_posts,
     upsert_idea,
+    clear_tweet_rows,
     list_recent_ideas,
 )
 
@@ -393,3 +395,148 @@ def test_process_posts_writes_log_line(isolated_db):
     line = isolated_db["log"].read_text()
     assert "fetched=1" in line
     assert "new_ideas=1" in line
+
+
+# ── Multi-ticker support (v3) ────────────────────────────────────────────
+
+
+def test_classify_and_extract_all_handles_tickers_array():
+    """A post mentioning multiple tickers via the new `tickers` field gets
+    expanded into N ExtractedIdea entries sharing direction/entry/stop."""
+    resp = {
+        "is_trade_idea": True,
+        "classify_confidence": 0.85,
+        "classify_reason": "multi-ticker profit-take update",
+        "thread_intent": "update",
+        "extraction": {
+            "tickers": ["$INTC", "$AMD", "$GOOGL"],
+            "direction": "long",
+            "entry_text": "took some profits",
+            "extract_confidence": 0.7,
+        },
+    }
+    cls, ideas = classify_and_extract_all(
+        "$INTC $AMD $GOOGL took some profits on these this AM FWIW",
+        llm_call=_fake_llm(resp),
+    )
+    assert cls.is_trade_idea is True
+    assert cls.thread_intent == "update"
+    assert len(ideas) == 3
+    assert [i.ticker for i in ideas] == ["$INTC", "$AMD", "$GOOGL"]
+    # Shared fields propagate to every row
+    for i in ideas:
+        assert i.direction == "long"
+        assert i.entry_text == "took some profits"
+
+
+def test_classify_and_extract_all_falls_back_to_single_ticker_field():
+    """Legacy LLM output that emits `ticker: string` instead of `tickers: []`
+    still yields one ExtractedIdea."""
+    resp = {
+        "is_trade_idea": True,
+        "classify_confidence": 0.9,
+        "extraction": {"ticker": "$SB_F", "direction": "long", "extract_confidence": 0.8},
+    }
+    cls, ideas = classify_and_extract_all(
+        "$SB_F L here",
+        llm_call=_fake_llm(resp),
+    )
+    assert len(ideas) == 1
+    assert ideas[0].ticker == "$SB_F"
+
+
+def test_classify_and_extract_single_returns_first_ticker():
+    """The legacy `classify_and_extract` signature must keep working for
+    callers that don't care about multi-ticker — it returns the first idea."""
+    resp = {
+        "is_trade_idea": True,
+        "classify_confidence": 0.85,
+        "extraction": {
+            "tickers": ["$INTC", "$AMD"],
+            "direction": "long",
+            "extract_confidence": 0.7,
+        },
+    }
+    cls, idea = classify_and_extract("$INTC $AMD bought", llm_call=_fake_llm(resp))
+    assert idea is not None
+    assert idea.ticker == "$INTC"
+
+
+def test_process_posts_persists_n_rows_for_multi_ticker_post(isolated_db):
+    """End-to-end: a single post with 3 tickers writes 3 trade_ideas rows
+    (one per ticker) and creates 3 distinct threads."""
+    fake = _fake_llm({
+        "is_trade_idea": True,
+        "classify_confidence": 0.85,
+        "thread_intent": "update",
+        "extraction": {
+            "tickers": ["$INTC", "$AMD", "$GOOGL"],
+            "direction": "long",
+            "entry_text": "took some profits",
+            "extract_confidence": 0.7,
+        },
+    })
+    posts = [{
+        "id": "MT1",
+        "text": "$INTC $AMD $GOOGL took some profits on these this AM FWIW",
+        "created_at": "2026-05-06T14:17:34Z",
+        "author": {"username": "canuck2usa"},
+    }]
+    summary = process_posts(posts, llm_call=fake, state_file=isolated_db["state"])
+    assert summary["extracted_valid"] == 3
+    assert summary["classified_idea"] == 1
+    con = duckdb.connect(str(isolated_db["db"]))
+    rows = con.execute(
+        "SELECT ticker, tweet_id, idea_id FROM trade_ideas WHERE tweet_id='MT1' ORDER BY ticker"
+    ).fetchall()
+    con.close()
+    assert len(rows) == 3
+    assert sorted(r[0] for r in rows) == ["$AMD", "$GOOGL", "$INTC"]
+    # idea_id is the unique key; all rows share tweet_id MT1
+    assert len({r[2] for r in rows}) == 3
+    assert all(r[1] == "MT1" for r in rows)
+
+
+def test_process_posts_multi_ticker_idempotent(isolated_db):
+    """Re-running the same multi-ticker post is a clean replace (no dups)."""
+    fake = _fake_llm({
+        "is_trade_idea": True,
+        "classify_confidence": 0.9,
+        "thread_intent": "new",
+        "extraction": {
+            "tickers": ["$AAPL", "$NVDA"],
+            "direction": "long",
+            "extract_confidence": 0.8,
+        },
+    })
+    post = [{
+        "id": "MT2",
+        "text": "$AAPL $NVDA bought a basket",
+        "created_at": "2026-05-07T10:00:00Z",
+        "author": {"username": "x"},
+    }]
+    # Run twice — state is cleared between runs, but DB writes should
+    # not duplicate.
+    process_posts(post, llm_call=fake, state_file=isolated_db["state"])
+    # Reset state to force re-processing
+    isolated_db["state"].write_text('{"processed_ids": []}')
+    process_posts(post, llm_call=fake, state_file=isolated_db["state"])
+    con = duckdb.connect(str(isolated_db["db"]))
+    n = con.execute(
+        "SELECT COUNT(*) FROM trade_ideas WHERE tweet_id='MT2'"
+    ).fetchone()[0]
+    con.close()
+    assert n == 2  # exactly one row per ticker, no duplicates
+
+
+def test_clear_tweet_rows_wipes_all_rows_for_tweet(isolated_db):
+    cls = Classification(is_trade_idea=True, classify_confidence=0.9)
+    for tk in ("$X", "$Y", "$Z"):
+        upsert_idea(tweet_id="WIPE", posted_at="2026-05-05T10:00:00Z",
+                     author_handle="a", raw_text="x", cls=cls,
+                     idea=ExtractedIdea(ticker=tk, direction="long"))
+    assert clear_tweet_rows("WIPE") == 3
+    con = duckdb.connect(str(isolated_db["db"]))
+    n = con.execute("SELECT COUNT(*) FROM trade_ideas WHERE tweet_id='WIPE'").fetchone()[0]
+    con.close()
+    assert n == 0

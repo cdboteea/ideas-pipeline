@@ -73,40 +73,52 @@ CODEX_BIN = "codex"
 # ── DuckDB schema ───────────────────────────────────────────────────────────
 
 CTL_SCHEMA_SQL = """
+-- v3 schema (2026-05-18): PK is `idea_id` (synthetic `<tweet_id>:<ticker>`)
+-- so a single tweet can produce N rows when it references multiple tickers
+-- (e.g. "$INTC $AMD $GOOGL took some profits on these"). `tweet_id` is
+-- retained as an indexed regular column. Legacy v2 DBs with tweet_id PK
+-- are migrated in-place by `_migrate_v2_to_v3`.
 CREATE TABLE IF NOT EXISTS trade_ideas (
     -- identity
-    tweet_id           TEXT PRIMARY KEY,
+    idea_id            TEXT PRIMARY KEY,  -- `<tweet_id>:<TICKER>` or `<tweet_id>:_` for commentary
+    tweet_id           TEXT NOT NULL,     -- original post id (now NON-unique)
     posted_at          TIMESTAMP,
-    author_handle      TEXT,            -- e.g. "CTLFutures"
+    author_handle      TEXT,              -- e.g. "CTLFutures"
     raw_text           TEXT,
 
     -- classifier output
     is_trade_idea      BOOLEAN,
-    classify_confidence DOUBLE,         -- 0.0–1.0
+    classify_confidence DOUBLE,           -- 0.0–1.0
     classify_reason    TEXT,
 
     -- extraction
-    ticker             TEXT,            -- "$SB_F", "$AMD" (preserves $ prefix)
-    direction          TEXT,            -- "long" / "short" / NULL
-    entry_text         TEXT,            -- raw entry phrase ("here", "@408", "1235-40 area")
-    entry_price        DOUBLE,          -- parsed numeric if extractable
-    stop_text          TEXT,            -- raw stop phrase ("Risk 14.94", "Hard 1164")
-    stop_price         DOUBLE,          -- parsed numeric
+    ticker             TEXT,              -- "$SB_F", "$AMD" (preserves $ prefix). Single value per row.
+    direction          TEXT,              -- "long" / "short" / NULL
+    entry_text         TEXT,              -- raw entry phrase ("here", "@408", "1235-40 area")
+    entry_price        DOUBLE,            -- parsed numeric if extractable
+    stop_text          TEXT,              -- raw stop phrase ("Risk 14.94", "Hard 1164")
+    stop_price         DOUBLE,            -- parsed numeric
     target_text        TEXT,
     target_price       DOUBLE,
-    horizon            TEXT,            -- "H4", "Swing", "intraday", "long-term"
-    tags               TEXT,            -- JSON array of #tags
+    horizon            TEXT,              -- "H4", "Swing", "intraday", "long-term"
+    tags               TEXT,              -- JSON array of #tags
     extract_confidence DOUBLE,
+
+    -- thread linkage (v2)
+    thread_id          TEXT,
+    thread_intent      TEXT,              -- new | update | close | unsure
 
     -- ops
     fetched_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    extractor_version  TEXT,            -- "v1"
-    llm_model          TEXT             -- "gpt-5.5" / "claude-code" / etc.
+    extractor_version  TEXT,              -- "v1"
+    llm_model          TEXT               -- e.g. "gemini-2.5-flash"
 );
 
+CREATE INDEX IF NOT EXISTS idx_trade_ideas_tweet     ON trade_ideas(tweet_id);
 CREATE INDEX IF NOT EXISTS idx_trade_ideas_posted_at ON trade_ideas(posted_at);
 CREATE INDEX IF NOT EXISTS idx_trade_ideas_author    ON trade_ideas(author_handle);
 CREATE INDEX IF NOT EXISTS idx_trade_ideas_ticker    ON trade_ideas(ticker);
+CREATE INDEX IF NOT EXISTS idx_trade_ideas_thread    ON trade_ideas(thread_id);
 
 -- v2: thread linkage (added by ALTER if upgrading from v1)
 CREATE TABLE IF NOT EXISTS trade_threads (
@@ -214,27 +226,148 @@ ALTER TABLE trade_ideas ADD COLUMN IF NOT EXISTS thread_intent TEXT;
 CREATE INDEX IF NOT EXISTS idx_trade_ideas_thread ON trade_ideas(thread_id);
 """
 
+# v3 migration: multi-ticker support.
+# Old PK was `tweet_id`, which couldn't represent a single post that
+# references multiple tickers (e.g. `$INTC $AMD $GOOGL took some profits`).
+# New PK is `idea_id` (synthetic `<tweet_id>:<ticker_or_underscore>`),
+# with `tweet_id` retained as an indexed regular column.
+#
+# Migration approach (idempotent): rebuild the table only if the legacy PK
+# is still on tweet_id. Detected via DESCRIBE → "key=PRI" on tweet_id.
+_TRADE_IDEAS_V3_COLS = """
+    idea_id            TEXT PRIMARY KEY,
+    tweet_id           TEXT NOT NULL,
+    posted_at          TIMESTAMP,
+    author_handle      TEXT,
+    raw_text           TEXT,
+    is_trade_idea      BOOLEAN,
+    classify_confidence DOUBLE,
+    classify_reason    TEXT,
+    ticker             TEXT,
+    direction          TEXT,
+    entry_text         TEXT,
+    entry_price        DOUBLE,
+    stop_text          TEXT,
+    stop_price         DOUBLE,
+    target_text        TEXT,
+    target_price       DOUBLE,
+    horizon            TEXT,
+    tags               TEXT,
+    extract_confidence DOUBLE,
+    fetched_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    extractor_version  TEXT,
+    llm_model          TEXT,
+    thread_id          TEXT,
+    thread_intent      TEXT
+"""
+
 
 def _con():
     CTL_DUCKDB_PATH.parent.mkdir(parents=True, exist_ok=True)
     return duckdb.connect(str(CTL_DUCKDB_PATH))
 
 
-def ensure_schema():
-    """Idempotent: creates v1 + v2 tables and runs the v1→v2 migration.
+def _build_idea_id(tweet_id: str, ticker: str | None) -> str:
+    """Synthesize an idea_id from (tweet_id, ticker).
 
-    Safe to call repeatedly. ALTER TABLE … ADD COLUMN IF NOT EXISTS is the
-    DuckDB-native way to add a column without erroring if it already exists.
+    Convention:
+      - `<tweet_id>:<TICKER>` for actual trade ideas. TICKER preserves $ prefix
+        and futures suffix.
+      - `<tweet_id>:_` for non-idea rows (commentary, classify_skip).
+
+    The combination is stable + unique per (tweet, ticker), so re-runs over
+    the same capture are idempotent and a single tweet that mentions N tickers
+    gets N distinct rows.
+    """
+    return f"{tweet_id}:{ticker or '_'}"
+
+
+def _needs_v3_migration(con) -> bool:
+    """Return True iff trade_ideas exists with PK on tweet_id (pre-v3 shape).
+    Returns False if table doesn't exist yet (CREATE will use v3) or if
+    already migrated (idea_id present)."""
+    try:
+        rows = con.execute("DESCRIBE trade_ideas").fetchall()
+    except Exception:
+        return False  # table doesn't exist; CREATE will use v3 directly
+    cols = {r[0]: r for r in rows}
+    if "idea_id" in cols:
+        return False  # already v3
+    if "tweet_id" in cols and cols["tweet_id"][3] == "PRI":
+        return True
+    return False
+
+
+def _migrate_v2_to_v3(con) -> None:
+    """Rebuild trade_ideas with idea_id PK. Idempotent — skips if already
+    migrated. Preserves existing rows; assigns each a derived idea_id."""
+    if not _needs_v3_migration(con):
+        return
+    logging.getLogger(__name__).info("CTL v3 migration: rebuilding trade_ideas with idea_id PK")
+    con.execute("BEGIN")
+    try:
+        # Drop indexes first — DuckDB blocks ALTER TABLE RENAME if any
+        # index references the table. List them via the system catalog so
+        # we drop whatever's actually present (set may have grown over time).
+        idx_rows = con.execute("""
+            SELECT index_name FROM duckdb_indexes()
+            WHERE table_name = 'trade_ideas'
+        """).fetchall()
+        for (idx_name,) in idx_rows:
+            con.execute(f'DROP INDEX IF EXISTS "{idx_name}"')
+
+        # Stage existing rows
+        con.execute("ALTER TABLE trade_ideas RENAME TO trade_ideas_v2")
+        # Create v3 with the new PK
+        con.execute(f"CREATE TABLE trade_ideas ({_TRADE_IDEAS_V3_COLS})")
+        # Copy with derived idea_id. NULLIF guards against empty-string tickers.
+        con.execute("""
+            INSERT INTO trade_ideas (
+                idea_id, tweet_id, posted_at, author_handle, raw_text,
+                is_trade_idea, classify_confidence, classify_reason,
+                ticker, direction, entry_text, entry_price,
+                stop_text, stop_price, target_text, target_price,
+                horizon, tags, extract_confidence,
+                fetched_at, extractor_version, llm_model,
+                thread_id, thread_intent
+            )
+            SELECT
+                tweet_id || ':' || COALESCE(NULLIF(ticker, ''), '_'),
+                tweet_id, posted_at, author_handle, raw_text,
+                is_trade_idea, classify_confidence, classify_reason,
+                ticker, direction, entry_text, entry_price,
+                stop_text, stop_price, target_text, target_price,
+                horizon, tags, extract_confidence,
+                fetched_at, extractor_version, llm_model,
+                thread_id, thread_intent
+            FROM trade_ideas_v2
+        """)
+        con.execute("DROP TABLE trade_ideas_v2")
+        con.execute("CREATE INDEX idx_trade_ideas_tweet      ON trade_ideas(tweet_id)")
+        con.execute("CREATE INDEX idx_trade_ideas_posted_at  ON trade_ideas(posted_at)")
+        con.execute("CREATE INDEX idx_trade_ideas_author     ON trade_ideas(author_handle)")
+        con.execute("CREATE INDEX idx_trade_ideas_ticker     ON trade_ideas(ticker)")
+        con.execute("CREATE INDEX idx_trade_ideas_thread     ON trade_ideas(thread_id)")
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+
+
+def ensure_schema():
+    """Idempotent: creates v1 + v2 tables, runs the v1→v2 + v2→v3 migrations.
+
+    Safe to call repeatedly. v3 migration (tweet_id PK → idea_id PK for
+    multi-ticker support) only fires if the legacy structure is detected.
     """
     con = _con()
     try:
         con.execute(CTL_SCHEMA_SQL)
-        # Run each migration statement separately (DuckDB requires it for
-        # multi-statement when one is an ALTER).
         for stmt in _MIGRATION_V1_TO_V2.strip().split(";\n"):
             stmt = stmt.strip()
             if stmt:
                 con.execute(stmt)
+        _migrate_v2_to_v3(con)
     finally:
         con.close()
 
@@ -301,9 +434,18 @@ POSITION UPDATES count as trade ideas if they reference a specific instrument
 ("$SB_F nice move so far", "$AMD trim 1/4 here", "stopped out of $XYZ").
 Set thread_intent accordingly (see TASK 2.5).
 
+A SINGLE post may reference MULTIPLE tickers — e.g.
+"$INTC $AMD $GOOGL took some profits on these this AM FWIW".
+In that case, list ALL tickers in the `tickers` array; the other fields
+(direction, entry, stop, target, horizon, tags, intent) are understood
+to apply to every ticker in the list. Single-ticker posts still use a
+1-element `tickers` array.
+
 TASK 2 — IF a trade idea, EXTRACT these fields (omit any that aren't stated):
-  - ticker: PRESERVE the dollar prefix and futures suffix exactly as written.
-    Examples are illustrative only; do NOT hallucinate tickers.
+  - tickers: ARRAY of tickers mentioned in this post. PRESERVE the dollar
+    prefix and futures suffix exactly as written. One-element array if the
+    post only references a single instrument. Examples are illustrative
+    only; do NOT hallucinate tickers.
   - direction: "long" or "short". "L" / "buy" / "long" → "long".
                                  "S" / "sell" / "short" → "short".
   - entry_text: the raw phrase ("here", "@408", "1235-40 area", "on dip").
@@ -410,6 +552,11 @@ def parse_llm_response(raw: str) -> dict:
 
 # JSON schema for a single trade-idea extraction. Used by both the
 # single-post and batch paths.
+#
+# `tickers` (array) is the canonical field for multi-ticker support
+# (e.g. "$INTC $AMD $GOOGL took profits"). For backward compatibility with
+# older LLM outputs / cached responses, we also tolerate `ticker` (string)
+# in `_parse_extraction_dict`. New prompts ask the model to emit `tickers`.
 _GEMINI_IDEA_SCHEMA = {
     "type": "object",
     "properties": {
@@ -420,7 +567,8 @@ _GEMINI_IDEA_SCHEMA = {
         "extraction": {
             "type": "object",
             "properties": {
-                "ticker":       {"type": "string"},
+                "tickers":      {"type": "array", "items": {"type": "string"}},
+                "ticker":       {"type": "string"},  # backward-compat fallback
                 "direction":    {"type": "string", "enum": ["long", "short"]},
                 "entry_text":   {"type": "string"},
                 "entry_price":  {"type": "number"},
@@ -625,13 +773,41 @@ def _gemini_call_batch(prompt: str, schema: dict, *, model: str) -> dict | None:
     return None
 
 
-def _parse_extraction_dict(data: dict) -> tuple[Classification, ExtractedIdea | None]:
-    """Convert a raw LLM-output dict (either {is_trade_idea, …, extraction: {…}}
-    shape from a single-post call, or one element of the batch `results`
-    array) into (Classification, ExtractedIdea|None).
+def _normalize_tickers(ext: dict) -> list[str]:
+    """Extract the ticker list from an LLM extraction object, supporting
+    both the new `tickers: array` schema and the legacy `ticker: string`
+    fallback. De-dups, preserves order, drops empty/whitespace entries.
+    """
+    out: list[str] = []
+    seen = set()
+    arr = ext.get("tickers")
+    if isinstance(arr, list):
+        for t in arr:
+            if isinstance(t, str):
+                t = t.strip()
+                if t and t not in seen:
+                    out.append(t)
+                    seen.add(t)
+    single = ext.get("ticker")
+    if isinstance(single, str):
+        single = single.strip()
+        if single and single not in seen:
+            out.append(single)
+            seen.add(single)
+    return out
 
-    Centralizes the field normalization so the single-post path and the
-    batched path can't drift.
+
+def _parse_extraction_dict_all(data: dict) -> tuple[Classification, list[ExtractedIdea]]:
+    """Convert a raw LLM-output dict into (Classification, [ExtractedIdea, ...]).
+
+    For multi-ticker posts, returns one ExtractedIdea per ticker — all sharing
+    the same direction / entry / stop / target / horizon / tags / confidence
+    fields (those describe the action, which applies uniformly to every
+    ticker the post references).
+
+    Returns an empty list when the post isn't a trade idea, or when it's
+    classified as a trade idea but the extraction block is missing or has
+    no tickers (caller treats as `extracted_dropped`).
     """
     intent = (data.get("thread_intent") or "unsure").lower().strip()
     if intent not in {"new", "update", "close", "unsure"}:
@@ -643,12 +819,15 @@ def _parse_extraction_dict(data: dict) -> tuple[Classification, ExtractedIdea | 
         thread_intent=intent,
     )
     if not cls.is_trade_idea:
-        return cls, None
+        return cls, []
     ext = data.get("extraction") or {}
     if not ext:
-        return cls, None
-    idea = ExtractedIdea(
-        ticker=ext.get("ticker"),
+        return cls, []
+    tickers = _normalize_tickers(ext)
+    if not tickers:
+        return cls, []
+    # All non-ticker fields are shared across tickers in the same post.
+    shared = dict(
         direction=ext.get("direction"),
         entry_text=ext.get("entry_text"),
         entry_price=_to_float(ext.get("entry_price")),
@@ -660,7 +839,20 @@ def _parse_extraction_dict(data: dict) -> tuple[Classification, ExtractedIdea | 
         tags=list(ext.get("tags") or []),
         extract_confidence=float(ext.get("extract_confidence", 0.0)),
     )
-    return cls, idea
+    return cls, [ExtractedIdea(ticker=t, **shared) for t in tickers]
+
+
+def _parse_extraction_dict(data: dict) -> tuple[Classification, ExtractedIdea | None]:
+    """Single-idea backward-compatible parse. Returns the FIRST ticker's
+    ExtractedIdea (or None) — used by `classify_and_extract` so test stubs
+    that inject `llm_call` with the legacy single-ticker response shape
+    keep working unchanged.
+
+    New callers (process_posts) should prefer `_parse_extraction_dict_all`
+    so multi-ticker posts produce N rows.
+    """
+    cls, ideas = _parse_extraction_dict_all(data)
+    return cls, (ideas[0] if ideas else None)
 
 
 def classify_and_extract(post_text: str, *, llm_call=None,
@@ -671,17 +863,32 @@ def classify_and_extract(post_text: str, *, llm_call=None,
     Legacy path (pre-2026-05-18): codex CLI / gpt-5. Still available via
     `llm_call=lambda p: call_codex(p)` for testing/comparison.
 
+    Returns the FIRST extracted idea only — for multi-ticker support use
+    `classify_and_extract_all` below.
+
     Note on `model`: when llm_call is None and model is None, the Gemini
     client's DEFAULT_MODEL (gemini-2.5-flash-lite) is used. Callers can
     pass `model="gemini-2.5-flash"` for higher quality at the cost of
     lower free-tier RPM.
+    """
+    cls, ideas = classify_and_extract_all(post_text, llm_call=llm_call, model=model)
+    return cls, (ideas[0] if ideas else None)
+
+
+def classify_and_extract_all(post_text: str, *, llm_call=None,
+                              model: str | None = None) -> tuple[Classification, list[ExtractedIdea]]:
+    """Multi-ticker variant of classify_and_extract.
+
+    For posts that reference multiple tickers (e.g. "$INTC $AMD took profits"),
+    returns one ExtractedIdea per ticker — all sharing the post's direction,
+    entry/stop/target text, horizon, tags. Commentary / non-idea posts return
+    an empty list.
 
     NB: For bulk runs, `process_posts` uses `_gemini_extract_batch` instead
     of looping over this function — single-post calls are orders of magnitude
     slower under the free-tier RPM ceiling.
     """
     if llm_call is None:
-        # New default: Gemini Flash with structured output.
         effective_model = model or (gemini_client.DEFAULT_MODEL if gemini_client else None)
         data = _gemini_extract(post_text, model=effective_model)
     else:
@@ -689,8 +896,7 @@ def classify_and_extract(post_text: str, *, llm_call=None,
                   "Reply with JSON only.")
         raw = llm_call(prompt)
         data = parse_llm_response(raw)
-
-    return _parse_extraction_dict(data)
+    return _parse_extraction_dict_all(data)
 
 
 def _to_float(v: Any) -> float | None:
@@ -742,27 +948,52 @@ def _normalize_timestamp(ts: Any) -> str | None:
         return None
 
 
+def clear_tweet_rows(tweet_id: str) -> int:
+    """Remove ALL rows in trade_ideas for the given tweet_id. Used before
+    re-persisting a multi-ticker post so a previous run's set is replaced
+    cleanly. Returns the count deleted (best-effort)."""
+    ensure_schema()
+    con = _con()
+    try:
+        rows = con.execute("SELECT COUNT(*) FROM trade_ideas WHERE tweet_id = ?", [tweet_id]).fetchone()[0]
+        con.execute("DELETE FROM trade_ideas WHERE tweet_id = ?", [tweet_id])
+        con.commit()
+        return rows
+    finally:
+        con.close()
+
+
 def upsert_idea(*, tweet_id: str, posted_at, author_handle: str, raw_text: str,
                  cls: Classification, idea: ExtractedIdea | None,
                  extractor_version: str = "v1", llm_model: str | None = None) -> None:
-    """Idempotent insert. DuckDB has no native UPSERT-with-PK, so we
-    DELETE-then-INSERT (consistent with the citrini-pipeline pattern)."""
+    """Idempotent single-row insert keyed on idea_id (= `<tweet_id>:<ticker>`).
+
+    Called once per (tweet, ticker) pair. For multi-ticker posts the caller
+    drives the loop — invoke `clear_tweet_rows(tweet_id)` first to wipe a
+    prior run's state, then call `upsert_idea` once per ticker.
+
+    For backward compat with the v2 behavior (single-row-per-tweet), this
+    function STILL wipes any prior row at the same idea_id before inserting
+    — so a re-run on the same (tweet, ticker) pair stays a clean replace.
+    """
     ensure_schema()
     posted_at_norm = _normalize_timestamp(posted_at)
+    idea_id = _build_idea_id(tweet_id, idea.ticker if idea else None)
     con = _con()
     try:
-        con.execute("DELETE FROM trade_ideas WHERE tweet_id = ?", [tweet_id])
+        con.execute("DELETE FROM trade_ideas WHERE idea_id = ?", [idea_id])
         tags_json = json.dumps(idea.tags) if (idea and idea.tags) else None
         con.execute("""
             INSERT INTO trade_ideas (
-                tweet_id, posted_at, author_handle, raw_text,
+                idea_id, tweet_id, posted_at, author_handle, raw_text,
                 is_trade_idea, classify_confidence, classify_reason,
                 ticker, direction, entry_text, entry_price,
                 stop_text, stop_price, target_text, target_price,
                 horizon, tags, extract_confidence,
                 extractor_version, llm_model
-            ) VALUES (?,?,?,?, ?,?,?, ?,?,?,?,?,?,?,?, ?,?,?, ?,?)
+            ) VALUES (?,?,?,?,?, ?,?,?, ?,?,?,?,?,?,?,?, ?,?,?, ?,?)
         """, [
+            idea_id,
             tweet_id, posted_at_norm, author_handle, raw_text,
             cls.is_trade_idea, cls.classify_confidence, cls.classify_reason,
             idea.ticker if idea else None,
@@ -955,10 +1186,12 @@ def process_posts(posts: list[dict], *, dry_run: bool = False,
                 data = batch_results.get(tid)
                 if data is None:
                     data = _gemini_extract(text, model=effective_model)
-                cls, idea = _parse_extraction_dict(data)
+                cls, ideas = _parse_extraction_dict_all(data)
             else:
                 # Legacy / test path — per-post LLM call.
-                cls, idea = classify_and_extract(text, llm_call=llm_call, model=model)
+                cls, ideas = classify_and_extract_all(
+                    text, llm_call=llm_call, model=model,
+                )
         except Exception as e:  # noqa: BLE001
             summary["errors"].append({
                 "tweet_id": tid,
@@ -969,52 +1202,84 @@ def process_posts(posts: list[dict], *, dry_run: bool = False,
         if not cls.is_trade_idea:
             summary["classified_skip"] += 1
             if not dry_run:
+                # Replace any prior multi-ticker rows for this tweet, then
+                # write a single commentary marker row (ticker=None).
+                clear_tweet_rows(tid)
                 upsert_idea(tweet_id=tid, posted_at=ts, author_handle=author,
                              raw_text=text, cls=cls, idea=None,
                              llm_model=effective_model)
                 seen.add(tid)
             continue
 
+        # Classified as a trade idea — validate per-ticker, then persist
+        # ALL valid ticker variants of this single post.
         summary["classified_idea"] += 1
-        if not idea:
+        if not ideas:
+            # LLM said is_trade_idea=true but emitted no tickers — the
+            # extraction is unusable. Capture as a drop with the raw text
+            # so we can spot-check why the model couldn't pick a ticker
+            # (commonly: multi-ticker post + ambiguous schema; covered
+            # post-2026-05-18 by the `tickers: array` field).
             summary["extracted_dropped"] += 1
-            continue
-        ok, reason = is_valid_idea(idea)
-        if not ok:
-            summary["extracted_dropped"] += 1
-            summary["errors"].append({"tweet_id": tid, "error": f"validation: {reason}"})
+            summary["errors"].append({
+                "tweet_id": tid,
+                "error": "validation: missing ticker (LLM returned empty tickers list)",
+                "raw_text": text[:140],
+            })
             continue
 
-        summary["extracted_valid"] += 1
+        valid_ideas: list[ExtractedIdea] = []
+        for idea in ideas:
+            ok, reason = is_valid_idea(idea)
+            if ok:
+                valid_ideas.append(idea)
+            else:
+                summary["errors"].append({
+                    "tweet_id": tid,
+                    "error":    f"validation ({idea.ticker!r}): {reason}",
+                })
+        if not valid_ideas:
+            summary["extracted_dropped"] += 1
+            continue
+
         if not dry_run:
-            upsert_idea(tweet_id=tid, posted_at=ts, author_handle=author,
-                         raw_text=text, cls=cls, idea=idea,
-                         llm_model=effective_model)
+            # Wipe prior rows for this tweet first (covers shrinking from
+            # N tickers to N-1, or a re-run that yielded a different set).
+            clear_tweet_rows(tid)
+
+        for idea in valid_ideas:
+            summary["extracted_valid"] += 1
+            if not dry_run:
+                upsert_idea(tweet_id=tid, posted_at=ts, author_handle=author,
+                             raw_text=text, cls=cls, idea=idea,
+                             llm_model=effective_model)
+                # Thread linkage + alert (after the post row exists).
+                # Each ticker gets its OWN thread keyed on (author, ticker).
+                if thread_link and idea.ticker:
+                    try:
+                        thread_id, action, thread_state = \
+                            ctl_threads.upsert_thread_for_post(
+                                tweet_id=tid, posted_at=ts,
+                                author=author, ticker=idea.ticker,
+                                cls=cls, idea=idea,
+                            )
+                        if emit_alerts and thread_id:
+                            _emit_thread_alert(action, thread_id, thread_state,
+                                                cls, idea, ctl_threads)
+                    except Exception as e:  # noqa: BLE001
+                        summary["errors"].append({
+                            "tweet_id": tid,
+                            "error":    f"thread/alert ({idea.ticker!r}): {type(e).__name__}: {e}",
+                        })
+            summary["ideas"].append({
+                "tweet_id": tid, "author": author, "ticker": idea.ticker,
+                "direction": idea.direction, "entry": idea.entry_text,
+                "stop": idea.stop_text, "target": idea.target_text,
+                "horizon": idea.horizon, "confidence": idea.extract_confidence,
+                "thread_intent": cls.thread_intent,
+            })
+        if not dry_run:
             seen.add(tid)
-            # Thread linkage + alert (after the post row exists)
-            if thread_link and idea.ticker:
-                try:
-                    thread_id, action, thread_state = \
-                        ctl_threads.upsert_thread_for_post(
-                            tweet_id=tid, posted_at=ts,
-                            author=author, ticker=idea.ticker,
-                            cls=cls, idea=idea,
-                        )
-                    if emit_alerts and thread_id:
-                        _emit_thread_alert(action, thread_id, thread_state,
-                                            cls, idea, ctl_threads)
-                except Exception as e:  # noqa: BLE001
-                    summary["errors"].append({
-                        "tweet_id": tid,
-                        "error":    f"thread/alert: {type(e).__name__}: {e}",
-                    })
-        summary["ideas"].append({
-            "tweet_id": tid, "author": author, "ticker": idea.ticker,
-            "direction": idea.direction, "entry": idea.entry_text,
-            "stop": idea.stop_text, "target": idea.target_text,
-            "horizon": idea.horizon, "confidence": idea.extract_confidence,
-            "thread_intent": cls.thread_intent,
-        })
 
     summary["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     if not dry_run:
