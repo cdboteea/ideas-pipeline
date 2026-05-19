@@ -617,6 +617,298 @@ def _gemini_extract(post_text: str, model: str | None = None) -> dict:
 _GEMINI_BATCH_CHUNK = 15
 
 
+# Batch envelope schema — used by both the Gemini batch path AND the new
+# external-LLM (CC subagent) path. Exposed at module level so callers can
+# pass the schema to a subagent for structured-output validation.
+BATCH_RESULT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "results": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id":                  {"type": "string"},
+                    "is_trade_idea":       {"type": "boolean"},
+                    "classify_confidence": {"type": "number"},
+                    "classify_reason":     {"type": "string"},
+                    "thread_intent": {
+                        "type": "string",
+                        "enum": ["new", "update", "close", "unsure"],
+                    },
+                    "extraction": _GEMINI_IDEA_SCHEMA["properties"]["extraction"],
+                },
+                "required": ["id", "is_trade_idea", "classify_confidence", "thread_intent"],
+            },
+        },
+    },
+    "required": ["results"],
+}
+
+
+def _build_batch_input_block(items: list[dict]) -> str:
+    """Format a list of {id, text} dicts as the BATCH INPUT body the
+    classifier prompt expects. Shared between Gemini and CC-subagent paths
+    so the wire format can't drift."""
+    return "\n\n".join(
+        f'ID: {it["id"]}\nText: """{(it.get("text") or "")[:1500]}"""'
+        for it in items
+    )
+
+
+def build_batch_prompt(
+    posts: list[dict],
+    *,
+    state_file: Path = CTL_STATE_FILE,
+) -> dict:
+    """Build the full classification prompt + JSON schema for unseen posts.
+
+    Use this when the LLM call happens OUTSIDE this Python process —
+    e.g. when `/ctl-poll` (a CC slash command) delegates classification
+    to a CC subagent via the Agent tool. Pair with `apply_classifications`
+    to persist what the subagent returns.
+
+    Args:
+        posts: list of normalized post dicts (shape from
+            `ideas.x_personal.normalize_capture`).
+        state_file: state file containing already-processed tweet IDs.
+
+    Returns:
+        {
+          "prompt":        <full prompt string with EXTRACTOR_PROMPT + items>,
+          "schema":        <JSON schema for the {results: [...]} response>,
+          "item_ids":      <ordered list of tweet_ids being classified>,
+          "skipped_seen":  <int — how many posts were filtered out as already seen>,
+          "total_unseen":  <int — len(item_ids)>,
+        }
+
+        When `total_unseen == 0`, `prompt` is "" — caller should skip the
+        LLM step entirely and just run `apply_classifications` with an empty
+        classifications dict to bump the state counter.
+    """
+    state = load_state(state_file)
+    seen = set(state.get("processed_ids", []))
+    unseen: list[dict] = []
+    skipped_seen = 0
+    for p in posts:
+        tid = str(p.get("id") or "")
+        if not tid:
+            continue
+        if tid in seen:
+            skipped_seen += 1
+            continue
+        unseen.append(p)
+
+    if not unseen:
+        return {
+            "prompt": "",
+            "schema": BATCH_RESULT_SCHEMA,
+            "item_ids": [],
+            "skipped_seen": skipped_seen,
+            "total_unseen": 0,
+        }
+
+    items_block = _build_batch_input_block(
+        [{"id": str(p["id"]), "text": p.get("text") or ""} for p in unseen]
+    )
+    prompt = (
+        EXTRACTOR_PROMPT
+        + "\n\n--- BATCH INPUT ---\n"
+          "You will receive MULTIPLE posts below. For EACH post, return the\n"
+          "same per-post object shape described above, but in a top-level\n"
+          "`results` array. Echo each post's ID exactly in the `id` field.\n"
+          "Do NOT merge, summarize, or skip posts — one result entry per ID.\n\n"
+        + items_block
+        + "\n--- END BATCH ---\n"
+    )
+
+    return {
+        "prompt": prompt,
+        "schema": BATCH_RESULT_SCHEMA,
+        "item_ids": [str(p["id"]) for p in unseen],
+        "skipped_seen": skipped_seen,
+        "total_unseen": len(unseen),
+    }
+
+
+def apply_classifications(
+    posts: list[dict],
+    classifications: dict,
+    *,
+    dry_run: bool = False,
+    state_file: Path = CTL_STATE_FILE,
+    thread_link: bool = True,
+    emit_alerts: bool = True,
+    llm_model: str = "cc-subagent",
+    extractor_version: str = "v1",
+) -> dict:
+    """Persist classifications produced by an external LLM call.
+
+    Companion to `build_batch_prompt`. Bypasses the internal Gemini path
+    entirely. Validation, threading, alerting, state-file bump, and log
+    line are unchanged from `process_posts`.
+
+    Args:
+        posts: list of normalized post dicts (full set, not just unseen —
+            we re-filter here so this remains the source-of-truth idempotency
+            boundary).
+        classifications: the LLM's response, shape:
+            {"results": [{id, is_trade_idea, classify_confidence,
+                          classify_reason, thread_intent, extraction}, ...]}
+            (matches `BATCH_RESULT_SCHEMA`). Extra keys ignored; missing
+            entries logged as `extracted_dropped`.
+        llm_model: tag persisted to `trade_ideas.llm_model` for every row
+            (default 'cc-subagent' for CC-orchestrated runs).
+
+    Returns:
+        Same shape as `process_posts.summary`.
+    """
+    # Import here to avoid module-load cycle
+    from . import ctl_threads
+    state = load_state(state_file)
+    seen = set(state.get("processed_ids", []))
+
+    summary = {
+        "started_at":  datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "fetched":     len(posts),
+        "skipped_seen":      0,
+        "classified_idea":   0,
+        "classified_skip":   0,
+        "extracted_valid":   0,
+        "extracted_dropped": 0,
+        "errors":            [],
+        "ideas":             [],
+        "dry_run":           dry_run,
+        "model":             llm_model,
+    }
+
+    # Index classifications by id for O(1) lookup
+    by_id: dict[str, dict] = {}
+    if isinstance(classifications, dict) and isinstance(classifications.get("results"), list):
+        for r in classifications["results"]:
+            if isinstance(r, dict):
+                rid = str(r.get("id") or "").strip()
+                if rid:
+                    by_id[rid] = r
+
+    for p in posts:
+        tid = str(p.get("id") or "")
+        if not tid:
+            summary["errors"].append({"tweet_id": None, "error": "missing id"})
+            continue
+        if tid in seen:
+            summary["skipped_seen"] += 1
+            continue
+
+        text   = p.get("text") or ""
+        author = (p.get("author") or {}).get("username") or p.get("handle") or ""
+        ts     = p.get("created_at")
+
+        data = by_id.get(tid)
+        if data is None:
+            summary["errors"].append({
+                "tweet_id": tid,
+                "error":    "no classification returned for this id",
+            })
+            continue
+
+        try:
+            cls, ideas = _parse_extraction_dict_all(data)
+        except Exception as e:  # noqa: BLE001
+            summary["errors"].append({
+                "tweet_id": tid,
+                "error":    f"parse: {type(e).__name__}: {e}",
+            })
+            continue
+
+        if not cls.is_trade_idea:
+            summary["classified_skip"] += 1
+            if not dry_run:
+                clear_tweet_rows(tid)
+                upsert_idea(tweet_id=tid, posted_at=ts, author_handle=author,
+                             raw_text=text, cls=cls, idea=None,
+                             llm_model=llm_model,
+                             extractor_version=extractor_version)
+                seen.add(tid)
+            continue
+
+        summary["classified_idea"] += 1
+        if not ideas:
+            summary["extracted_dropped"] += 1
+            summary["errors"].append({
+                "tweet_id": tid,
+                "error": "validation: missing ticker (LLM returned empty tickers list)",
+                "raw_text": text[:140],
+            })
+            continue
+
+        valid_ideas: list[ExtractedIdea] = []
+        for idea in ideas:
+            ok, reason = is_valid_idea(idea)
+            if ok:
+                valid_ideas.append(idea)
+            else:
+                summary["errors"].append({
+                    "tweet_id": tid,
+                    "error":    f"validation ({idea.ticker!r}): {reason}",
+                })
+        if not valid_ideas:
+            summary["extracted_dropped"] += 1
+            continue
+
+        if not dry_run:
+            clear_tweet_rows(tid)
+
+        for idea in valid_ideas:
+            summary["extracted_valid"] += 1
+            if not dry_run:
+                upsert_idea(tweet_id=tid, posted_at=ts, author_handle=author,
+                             raw_text=text, cls=cls, idea=idea,
+                             llm_model=llm_model,
+                             extractor_version=extractor_version)
+                if thread_link and idea.ticker:
+                    try:
+                        thread_id, action, thread_state = \
+                            ctl_threads.upsert_thread_for_post(
+                                tweet_id=tid, posted_at=ts,
+                                author=author, ticker=idea.ticker,
+                                cls=cls, idea=idea,
+                            )
+                        if emit_alerts and thread_id:
+                            _emit_thread_alert(action, thread_id, thread_state,
+                                                cls, idea, ctl_threads)
+                    except Exception as e:  # noqa: BLE001
+                        summary["errors"].append({
+                            "tweet_id": tid,
+                            "error":    f"thread/alert ({idea.ticker!r}): {type(e).__name__}: {e}",
+                        })
+            summary["ideas"].append({
+                "tweet_id": tid, "author": author, "ticker": idea.ticker,
+                "direction": idea.direction, "entry": idea.entry_text,
+                "stop": idea.stop_text, "target": idea.target_text,
+                "horizon": idea.horizon, "confidence": idea.extract_confidence,
+                "thread_intent": cls.thread_intent,
+            })
+        if not dry_run:
+            seen.add(tid)
+
+    summary["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    if not dry_run:
+        state["processed_ids"] = sorted(seen)[-2000:]
+        save_state(state, state_file)
+        try:
+            CTL_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with CTL_LOG_FILE.open("a") as f:
+                f.write(f"{summary['finished_at']} fetched={summary['fetched']} "
+                        f"new_ideas={summary['extracted_valid']} "
+                        f"skip_commentary={summary['classified_skip']} "
+                        f"errors={len(summary['errors'])} model={llm_model}\n")
+        except OSError:
+            pass
+
+    return summary
+
+
 def _gemini_extract_batch(
     items: list[dict],
     *,
@@ -644,41 +936,15 @@ def _gemini_extract_batch(
     if not items:
         return {}
 
-    # Wrap the per-post schema in a {results: [...]} envelope.
-    batch_schema = {
-        "type": "object",
-        "properties": {
-            "results": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id":                  {"type": "string"},
-                        "is_trade_idea":       {"type": "boolean"},
-                        "classify_confidence": {"type": "number"},
-                        "classify_reason":     {"type": "string"},
-                        "thread_intent": {
-                            "type": "string",
-                            "enum": ["new", "update", "close", "unsure"],
-                        },
-                        "extraction": _GEMINI_IDEA_SCHEMA["properties"]["extraction"],
-                    },
-                    "required": ["id", "is_trade_idea", "classify_confidence", "thread_intent"],
-                },
-            },
-        },
-        "required": ["results"],
-    }
+    # Shared schema with the CC-subagent path (BATCH_RESULT_SCHEMA).
+    batch_schema = BATCH_RESULT_SCHEMA
 
     out: dict[str, dict] = {}
     eff_model = model or gemini_client.DEFAULT_MODEL
 
     for start in range(0, len(items), chunk_size):
         chunk = items[start : start + chunk_size]
-        posts_block = "\n\n".join(
-            f'ID: {it["id"]}\nText: """{(it.get("text") or "")[:1500]}"""'
-            for it in chunk
-        )
+        posts_block = _build_batch_input_block(chunk)
         prompt = (
             EXTRACTOR_PROMPT
             + "\n\n--- BATCH INPUT ---\n"

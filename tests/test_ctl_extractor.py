@@ -24,6 +24,9 @@ from ideas.ctl_extractor import (
     upsert_idea,
     clear_tweet_rows,
     list_recent_ideas,
+    build_batch_prompt,
+    apply_classifications,
+    BATCH_RESULT_SCHEMA,
 )
 
 
@@ -540,3 +543,134 @@ def test_clear_tweet_rows_wipes_all_rows_for_tweet(isolated_db):
     n = con.execute("SELECT COUNT(*) FROM trade_ideas WHERE tweet_id='WIPE'").fetchone()[0]
     con.close()
     assert n == 0
+
+
+# ── Two-phase pipeline (build_batch_prompt + apply_classifications) ────────
+
+
+def test_build_batch_prompt_filters_seen_and_includes_schema(isolated_db):
+    posts = [
+        {"id": "B1", "text": "$AAPL long at 408", "created_at": "2026-05-05T10:00:00Z",
+         "author": {"username": "x"}},
+        {"id": "B2", "text": "$MSFT short", "created_at": "2026-05-05T11:00:00Z",
+         "author": {"username": "y"}},
+        {"id": "B3", "text": "just commentary", "created_at": "2026-05-05T12:00:00Z",
+         "author": {"username": "z"}},
+    ]
+    # mark B1 as already seen
+    isolated_db["state"].write_text(json.dumps({"processed_ids": ["B1"]}))
+    bundle = build_batch_prompt(posts, state_file=isolated_db["state"])
+    assert bundle["skipped_seen"] == 1
+    assert bundle["total_unseen"] == 2
+    assert bundle["item_ids"] == ["B2", "B3"]
+    # Prompt contains EXTRACTOR_PROMPT scaffolding + only unseen items
+    assert "B2" in bundle["prompt"]
+    assert "B3" in bundle["prompt"]
+    assert "B1" not in bundle["prompt"]
+    # Schema matches the batch envelope
+    assert bundle["schema"] == BATCH_RESULT_SCHEMA
+
+
+def test_build_batch_prompt_returns_empty_when_all_seen(isolated_db):
+    posts = [{"id": "S1", "text": "x", "created_at": "2026-05-05T10:00:00Z",
+              "author": {"username": "x"}}]
+    isolated_db["state"].write_text(json.dumps({"processed_ids": ["S1"]}))
+    bundle = build_batch_prompt(posts, state_file=isolated_db["state"])
+    assert bundle["total_unseen"] == 0
+    assert bundle["prompt"] == ""
+    assert bundle["item_ids"] == []
+
+
+def test_apply_classifications_persists_and_tags_llm_model(isolated_db):
+    """End-to-end: pre-computed classifications get validated + persisted."""
+    posts = [
+        {"id": "A1", "text": "$AMD 408", "created_at": "2026-05-05T10:00:00Z",
+         "author": {"username": "canuck2usa"}},
+        {"id": "A2", "text": "just commentary", "created_at": "2026-05-05T11:00:00Z",
+         "author": {"username": "canuck2usa"}},
+    ]
+    classifications = {
+        "results": [
+            {
+                "id": "A1",
+                "is_trade_idea": True,
+                "classify_confidence": 0.85,
+                "classify_reason": "ticker + price",
+                "thread_intent": "new",
+                "extraction": {
+                    "tickers": ["$AMD"],
+                    "direction": "long",
+                    "entry_text": "408",
+                    "entry_price": 408.0,
+                    "extract_confidence": 0.7,
+                },
+            },
+            {
+                "id": "A2",
+                "is_trade_idea": False,
+                "classify_confidence": 0.9,
+                "classify_reason": "commentary",
+                "thread_intent": "unsure",
+            },
+        ]
+    }
+    summary = apply_classifications(
+        posts, classifications,
+        state_file=isolated_db["state"],
+        llm_model="cc-subagent-test",
+    )
+    assert summary["classified_idea"] == 1
+    assert summary["classified_skip"] == 1
+    assert summary["extracted_valid"] == 1
+    assert summary["model"] == "cc-subagent-test"
+    con = duckdb.connect(str(isolated_db["db"]))
+    rows = con.execute(
+        "SELECT ticker, llm_model FROM trade_ideas WHERE tweet_id='A1'"
+    ).fetchall()
+    con.close()
+    assert rows == [("$AMD", "cc-subagent-test")]
+
+
+def test_apply_classifications_handles_missing_results_gracefully(isolated_db):
+    """If the LLM didn't return a result for a tweet, log an error but
+    don't crash the run."""
+    posts = [{"id": "M1", "text": "$X", "created_at": "2026-05-05T10:00:00Z",
+              "author": {"username": "x"}}]
+    summary = apply_classifications(
+        posts, {"results": []},  # no result for M1
+        state_file=isolated_db["state"],
+    )
+    assert summary["classified_idea"] == 0
+    assert any("no classification returned" in str(e.get("error", ""))
+               for e in summary["errors"])
+
+
+def test_apply_classifications_multi_ticker_persists_n_rows(isolated_db):
+    """Multi-ticker post via the CC-subagent path produces N rows."""
+    posts = [{"id": "MT1", "text": "$INTC $AMD $GOOGL took profits",
+              "created_at": "2026-05-08T16:00:00Z",
+              "author": {"username": "canuck2usa"}}]
+    classifications = {
+        "results": [{
+            "id": "MT1",
+            "is_trade_idea": True,
+            "classify_confidence": 0.85,
+            "thread_intent": "update",
+            "extraction": {
+                "tickers": ["$INTC", "$AMD", "$GOOGL"],
+                "direction": "long",
+                "entry_text": "took profits",
+                "extract_confidence": 0.7,
+            },
+        }]
+    }
+    summary = apply_classifications(
+        posts, classifications, state_file=isolated_db["state"],
+    )
+    assert summary["extracted_valid"] == 3
+    con = duckdb.connect(str(isolated_db["db"]))
+    rows = con.execute(
+        "SELECT ticker FROM trade_ideas WHERE tweet_id='MT1' ORDER BY ticker"
+    ).fetchall()
+    con.close()
+    assert [r[0] for r in rows] == ["$AMD", "$GOOGL", "$INTC"]

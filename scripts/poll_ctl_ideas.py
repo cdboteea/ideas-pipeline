@@ -49,7 +49,26 @@ def main() -> int:
                     help="Show recent persisted trade ideas, then exit.")
     ap.add_argument("--limit", type=int, default=20)
     ap.add_argument("--model", default=None,
-                    help="Codex model override (default: codex CLI's default).")
+                    help="LLM model override. Default: gemini_client.DEFAULT_MODEL "
+                         "(gemini-2.5-flash-lite). Ignored when --classifications is used.")
+    # ── CC-subagent two-phase mode (Path C, 2026-05-18) ──
+    # When the LLM call happens OUTSIDE this script (i.e. in a CC slash
+    # command via the Agent tool), use these two modes to split the work:
+    ap.add_argument("--prepare-prompt", metavar="OUT_FILE",
+                    help="Phase 1: write the classification prompt + JSON schema for "
+                         "all unseen posts to OUT_FILE (as JSON), then exit. The "
+                         "caller (typically /ctl-poll slash command) reads OUT_FILE, "
+                         "sends prompt to a CC subagent with the schema, captures the "
+                         "subagent's JSON response, and re-invokes this script with "
+                         "--apply-classifications.")
+    ap.add_argument("--apply-classifications", metavar="CLASSIFICATIONS_FILE",
+                    help="Phase 2: read pre-computed classifications from "
+                         "CLASSIFICATIONS_FILE (JSON matching BATCH_RESULT_SCHEMA), "
+                         "validate, and persist to DuckDB. Skips internal Gemini "
+                         "call entirely. Use with `--llm-model` to tag rows.")
+    ap.add_argument("--llm-model", default="cc-subagent",
+                    help="Value to persist as trade_ideas.llm_model when using "
+                         "--apply-classifications. Default 'cc-subagent'.")
     args = ap.parse_args()
 
     if args.print_capture_js:
@@ -83,6 +102,58 @@ def main() -> int:
     raw = json.loads(args.capture.read_text())
     posts = x_personal.normalize_capture(raw)
 
+    # ── Phase 1: prepare prompt for external (CC subagent) classification ──
+    if args.prepare_prompt:
+        bundle = ctl.build_batch_prompt(posts)
+        out_path = Path(args.prepare_prompt)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(bundle, indent=2))
+        if args.json:
+            print(json.dumps({
+                "mode": "prepare-prompt",
+                "out_file": str(out_path),
+                "total_unseen": bundle["total_unseen"],
+                "skipped_seen": bundle["skipped_seen"],
+            }))
+        else:
+            print(f"# Wrote classification bundle → {out_path}")
+            print(f"  total_unseen: {bundle['total_unseen']}")
+            print(f"  skipped_seen: {bundle['skipped_seen']}")
+            if bundle["total_unseen"] == 0:
+                print("  (nothing to classify — proceed straight to --apply-classifications "
+                      'with an empty {"results": []} to bump state)')
+        return 0
+
+    # ── Phase 2: apply pre-computed classifications from a JSON file ──
+    if args.apply_classifications:
+        cfile = Path(args.apply_classifications)
+        if not cfile.exists():
+            print(f"classifications not found: {cfile}", file=sys.stderr)
+            return 2
+        classifications = json.loads(cfile.read_text())
+        summary = ctl.apply_classifications(
+            posts, classifications,
+            dry_run=args.dry_run,
+            llm_model=args.llm_model,
+        )
+        if args.json:
+            print(json.dumps(summary, indent=2, default=str))
+        else:
+            print(f"# CTL pipeline run (apply-classifications, model={summary['model']})")
+            print(f"  fetched:           {summary['fetched']}")
+            print(f"  skipped (seen):    {summary['skipped_seen']}")
+            print(f"  classified idea:   {summary['classified_idea']}")
+            print(f"  classified skip:   {summary['classified_skip']}")
+            print(f"  extracted valid:   {summary['extracted_valid']}"
+                  f"{'  (dry-run)' if summary['dry_run'] else ''}")
+            print(f"  extracted dropped: {summary['extracted_dropped']}")
+            if summary["errors"]:
+                print(f"  errors:            {len(summary['errors'])}")
+                for e in summary["errors"][:5]:
+                    print(f"    - {e}")
+        return 0
+
+    # ── Default: full pipeline (internal Gemini call) ──
     summary = ctl.process_posts(posts, dry_run=args.dry_run, model=args.model)
 
     if args.json:
