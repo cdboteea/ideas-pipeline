@@ -69,12 +69,34 @@ def main() -> int:
     ap.add_argument("--llm-model", default="cc-subagent",
                     help="Value to persist as trade_ideas.llm_model when using "
                          "--apply-classifications. Default 'cc-subagent'.")
+    ap.add_argument("--dump-seen-ids", metavar="OUT_FILE",
+                    help="Write the most-recent processed tweet IDs from "
+                         "ctl-state.json as a JSON array to OUT_FILE (capped via "
+                         "--seen-cap). Used by /ctl-poll to prime "
+                         "window.__seen_ids before the scroll-until-seen capture.")
+    ap.add_argument("--seen-cap", type=int, default=500,
+                    help="Max IDs to dump for --dump-seen-ids (default 500). "
+                         "ctl-state.json holds up to 2000 ids; the most recent "
+                         "(tail) are dumped.")
     args = ap.parse_args()
 
     if args.print_capture_js:
         # The CTL list uses the SAME timeline structure as the bookmarks page,
         # so the same capture JS works without modification.
         print(x_personal.BOOKMARKS_CAPTURE_JS)
+        return 0
+
+    if args.dump_seen_ids:
+        state = ctl.load_state()
+        ids = list(state.get("processed_ids", []))[-args.seen_cap:]
+        out = Path(args.dump_seen_ids)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(ids))
+        msg = f"dumped {len(ids)} seen tweet IDs (cap {args.seen_cap}) → {out}"
+        if args.json:
+            print(json.dumps({"mode": "dump-seen-ids", "out_file": str(out), "count": len(ids)}))
+        else:
+            print("# " + msg)
         return 0
 
     if args.list_recent:

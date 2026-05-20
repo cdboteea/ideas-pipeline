@@ -124,16 +124,22 @@ Two-step capture (in-session today; cron-ified once Chrome MCP transport stabili
 ```bash
 # 1. In a CC session with Chrome MCP attached:
 #    - Navigate Chrome to https://x.com/i/bookmarks
-#    - (scroll-load any older bookmarks you want captured)
+#    - (Optional but recommended) Prime window.__seen_ids with recently-
+#      ingested IDs so the capture JS knows when to stop scrolling. See
+#      docs/feed-watch-spec.md §10 "scroll-until-seen" — the canonical
+#      capture JS is a self-contained async IIFE that scrolls + harvests
+#      + stops at the first overlap with window.__seen_ids (or 60-scroll
+#      ceiling / 3-scroll no-growth, whichever comes first).
 #    - Run the capture JS via `mcp__Claude_in_Chrome__javascript_tool`:
 poll_x_bookmarks_personal.py --print-capture-js
-#    - Save the returned JSON to /tmp/x-bookmarks-capture.json
+#    - Save window.__xbm_json (or read back via console.log + read_console_messages)
+#      to /tmp/x-bookmarks-capture.json
 
 # 2. Diff vs personal-state and stage to Inbox
 poll_x_bookmarks_personal.py /tmp/x-bookmarks-capture.json [--dry-run] [--json]
 ```
 
-The capture JS strips `@` prefixes from handles to bypass the Chrome MCP response filter (which heuristics `@user` patterns as sensitive); `normalize_capture` rebuilds the canonical `@handle` on the Python side.
+The capture JS strips `@` prefixes from handles to bypass the Chrome MCP response filter (which heuristics `@user` patterns as sensitive); `normalize_capture` rebuilds the canonical `@handle` on the Python side. The same `BOOKMARKS_CAPTURE_JS` constant in `ideas/x_personal.py` is also used by `/ctl-poll` (list timeline) and `/feed-x-general-once` (Following → Recent home feed) — same DOM shape, same scroll-until-seen logic.
 
 ## Auto-archive
 

@@ -43,44 +43,99 @@ PERSONAL_STATE_FILE = Path.home() / "clawd" / "data" / "x-bookmarks-personal-sta
 
 
 # JavaScript injected via Claude-in-Chrome `javascript_tool` to extract
-# bookmarks from the live DOM. Returns a list of normalized tweet dicts —
-# small payload (~300 bytes/tweet) so it survives the MCP response filter.
+# posts/bookmarks from the live DOM AND scroll-until-seen.
 #
-# Caller is expected to navigate to https://x.com/i/bookmarks first AND
-# scroll-load any earlier bookmarks they want captured (X uses infinite
-# scroll). The JS reads whatever articles are currently rendered.
+# Caller is expected to navigate to the target page (bookmarks / list / home
+# Following) first. The JS scrolls top→bottom, accumulating tweets into a
+# Map keyed by tweet ID, stopping when:
+#   (a) it encounters a tweet ID already in window.__seen_ids (set the caller
+#       primed via a separate javascript_tool call) — i.e., we've reached
+#       overlap with previously-captured state, OR
+#   (b) it sees N consecutive scrolls with zero new IDs (feed exhausted), OR
+#   (c) it hits the safety ceiling (MAX_SCROLLS).
+#
+# window.__seen_ids may be a Set, Array, or absent. Absent ⇒ scroll-to-bottom
+# (capped at MAX_SCROLLS / NO_GROWTH_SCROLLS).
+#
+# Stashes the final payload at window.__xbm AND window.__xbm_json (the latter
+# so the caller can console.log+read it back when MCP truncates the
+# javascript_tool response). Also returns the post count from the IIFE.
 BOOKMARKS_CAPTURE_JS = r"""
-(function(){
-  const out = [];
-  const articles = document.querySelectorAll('article[data-testid="tweet"]');
-  for (const art of articles) {
-    const statusLink = art.querySelector('a[href*="/status/"]');
-    const href = statusLink ? statusLink.getAttribute('href') : null;
-    let id = null, handle = null;
-    if (href) {
+(async function(){
+  const seenInput = window.__seen_ids;
+  const seen = (seenInput instanceof Set)
+    ? seenInput
+    : new Set(Array.isArray(seenInput) ? seenInput : []);
+  const harvested = new Map();
+  const MAX_SCROLLS = 60;
+  const SCROLL_BY = 900;
+  const WAIT_MS = 1100;
+  const NO_GROWTH_SCROLLS = 3;
+  let scrollsSinceGrowth = 0;
+  let hitSeen = false;
+
+  function harvestOnce(){
+    let newCount = 0;
+    const articles = document.querySelectorAll('article[data-testid="tweet"]');
+    for (const art of articles) {
+      const statusLink = art.querySelector('a[href*="/status/"]');
+      const href = statusLink ? statusLink.getAttribute('href') : null;
+      if (!href) continue;
       const m = href.match(/^\/([^\/]+)\/status\/(\d+)/);
-      if (m) { handle = m[1]; id = m[2]; }   // strip @ to bypass MCP filter
+      if (!m) continue;
+      const handle = m[1], id = m[2];   // strip @ to bypass MCP filter
+      if (harvested.has(id)) continue;
+      if (seen.has(id)) { hitSeen = true; continue; }
+      const timeEl = art.querySelector('time');
+      const created_at = timeEl ? timeEl.getAttribute('datetime') : null;
+      const userBlock = art.querySelector('[data-testid="User-Name"]');
+      const display = userBlock
+        ? (userBlock.textContent.split('\n')[0] || null)
+        : null;
+      const tt = art.querySelector('[data-testid="tweetText"]');
+      const text = tt ? tt.textContent : '';
+      const photos = art.querySelectorAll('[data-testid="tweetPhoto"]').length;
+      const videos = art.querySelectorAll('video').length;
+      harvested.set(id, {
+        id, handle, display, created_at, text,
+        media: { photos, videos },
+      });
+      newCount++;
     }
-    if (!id) continue;
-    const timeEl = art.querySelector('time');
-    const created_at = timeEl ? timeEl.getAttribute('datetime') : null;
-    const userBlock = art.querySelector('[data-testid="User-Name"]');
-    let display = null;
-    if (userBlock) {
-      // First line is display name; the rest contains '@handle · time' which
-      // we don't need (handle already extracted from URL).
-      display = userBlock.textContent.split('\n')[0] || null;
-    }
-    const tt = art.querySelector('[data-testid="tweetText"]');
-    const text = tt ? tt.textContent : '';
-    const photos = art.querySelectorAll('[data-testid="tweetPhoto"]').length;
-    const videos = art.querySelectorAll('video').length;
-    out.push({
-      id, handle, display, created_at, text,
-      media: { photos, videos },
-    });
+    return newCount;
   }
-  return { count: out.length, bookmarks: out };
+
+  window.scrollTo(0, 0);
+  await new Promise(r => setTimeout(r, 1500));
+  harvestOnce();
+
+  let scrolls = 0;
+  for (; scrolls < MAX_SCROLLS; scrolls++) {
+    window.scrollBy(0, SCROLL_BY);
+    await new Promise(r => setTimeout(r, WAIT_MS));
+    const newCount = harvestOnce();
+    if (hitSeen) break;
+    if (newCount === 0) {
+      scrollsSinceGrowth++;
+      if (scrollsSinceGrowth >= NO_GROWTH_SCROLLS) break;
+    } else {
+      scrollsSinceGrowth = 0;
+    }
+  }
+
+  const out = Array.from(harvested.values());
+  const stopReason = hitSeen
+    ? "hit-seen"
+    : (scrollsSinceGrowth >= NO_GROWTH_SCROLLS ? "no-growth" : "max-scrolls");
+  window.__xbm = {
+    count: out.length,
+    bookmarks: out,
+    stop_reason: stopReason,
+    scrolls: scrolls,
+    seen_size: seen.size,
+  };
+  window.__xbm_json = JSON.stringify(window.__xbm);
+  return { count: out.length, stop_reason: stopReason, scrolls };
 })()
 """
 
